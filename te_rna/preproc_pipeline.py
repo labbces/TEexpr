@@ -157,8 +157,8 @@ def download_sample(srr):
 		
 		result_r2 = subprocess.run(wget_cmd_r2, capture_output=True, text=True)
 		if result_r2.returncode != 0:
-			if result_r1.returncode == 416:  # 416 means file already fully downloaded
-				print(f"[DOWNLOAD] ✓ {srr} R1 already downloaded, skipping...")
+			if result_r2.returncode == 416:  # 416 means file already fully downloaded
+				print(f"[DOWNLOAD] ✓ {srr} R2 already downloaded, skipping...")
 				pass
 			print(f"[DOWNLOAD] Error downloading R2 for {srr}: {result_r2.stderr}")
 			if os.path.exists(r1_output):
