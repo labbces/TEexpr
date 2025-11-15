@@ -25,19 +25,81 @@ import queue
 import time
 import sys
 import shutil
+import logging
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 # Arguments
 parser = argparse.ArgumentParser()
+parser.add_argument("--sra_list", required=True, help="File with the IDs (SRR)")
+parser.add_argument("--transcripts", required=True, help="Path to transcriptome FASTA file")
+parser.add_argument("--config", default="config.yaml", help="Path to configuration YAML file")
+parser.add_argument("--outdir", default="pipeline_output", help="Output directory")
 parser.add_argument("--salmon_path", default="salmon", help="Path to Salmon")
 parser.add_argument("--fastqc_path", default="fastqc", help="Path to FastQC")
 parser.add_argument("--bbduk_path", default="bbduk.sh", help="Path to BBduk")
-parser.add_argument("--sra_list", required=True, help="File with the IDs (SRR)")
-parser.add_argument("--outdir", default="pipeline_output", help="Output directory")
-parser.add_argument("--transcripts", required=True, help="Path to transcriptome FASTA file")
-parser.add_argument("--parallel_jobs", default="4", help="Maximum number of parallel jobs")
-parser.add_argument("--base_url", default="https://labbces.cena.usp.br/SRR/NCBI/sra_datasets/", help="Base URL for downloading FASTQ files")
+parser.add_argument("--parallel_jobs", default="5", help="Maximum number of parallel jobs")
+parser.add_argument("--decoy", help="Path to decoy sequences FASTA file (optional)")
 args = parser.parse_args()
+
+if not os.path.exists(args.config):
+	print(f"Configuration file not found: {args.config}")
+	sys.exit(1)
+
+# Parse simple config file (base_url, user, password)
+with open(args.config, 'r') as config_file:
+	args.base_url = None
+	args.user = None
+	args.password = None
+	
+	for line in config_file:
+		line = line.strip()
+		if line and not line.startswith('#'):
+			if line.startswith('base_url:'):
+				args.base_url = line.split(':', 1)[1].strip().strip('"\'')
+			elif line.startswith('user:'):
+				args.user = line.split(':', 1)[1].strip().strip('"\'')
+			elif line.startswith('password:'):
+				args.password = line.split(':', 1)[1].strip().strip('"\'')
+
+# Setup logging
+def setup_logging(outdir):
+	"""Configure logging for the pipeline"""
+	log_dir = os.path.join(outdir, "logs")
+	os.makedirs(log_dir, exist_ok=True)
+	
+	# Create formatters
+	detailed_formatter = logging.Formatter(
+		'%(asctime)s - %(name)s - %(levelname)s - [%(threadName)s] - %(message)s',
+		datefmt='%Y-%m-%d %H:%M:%S'
+	)
+	simple_formatter = logging.Formatter(
+		'%(asctime)s - %(levelname)s - %(message)s',
+		datefmt='%H:%M:%S'
+	)
+	
+	# Setup root logger
+	logger = logging.getLogger()
+	logger.setLevel(logging.INFO)
+	
+	# File handler for detailed logs
+	file_handler = logging.FileHandler(os.path.join(log_dir, "pipeline.log"))
+	file_handler.setLevel(logging.INFO)
+	file_handler.setFormatter(detailed_formatter)
+	logger.addHandler(file_handler)
+	
+	# Console handler for user-friendly output
+	console_handler = logging.StreamHandler(sys.stdout)
+	console_handler.setLevel(logging.INFO)
+	console_handler.setFormatter(simple_formatter)
+	logger.addHandler(console_handler)
+	
+	# Error log file
+	error_handler = logging.FileHandler(os.path.join(log_dir, "errors.log"))
+	error_handler.setLevel(logging.ERROR)
+	error_handler.setFormatter(detailed_formatter)
+	logger.addHandler(error_handler)
+	
+	return logger
 
 # Creating directories
 outdir = os.path.abspath(os.path.expanduser(args.outdir))
@@ -55,6 +117,11 @@ os.makedirs(fastqc_dir, exist_ok=True)
 os.makedirs(clean_dir, exist_ok=True)
 os.makedirs(salmon_index_dir, exist_ok=True)
 os.makedirs(salmon_results_dir, exist_ok=True)
+
+# Initialize logging
+logger = setup_logging(outdir)
+logger.info("Pipeline initialized successfully")
+logger.info(f"Output directory: {outdir}")
 
 # Read IDs and fill list with SRRs
 sra_ids = {}
@@ -103,8 +170,8 @@ def check_fastqc_completed(srr):
 
 def check_cleaning_completed(srr):
 	"""Check if BBduk cleaning is already completed for a sample"""
-	clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq")
-	clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq")
+	clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
+	clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
 	return os.path.exists(clean_r1) and os.path.getsize(clean_r1) > 0 and os.path.exists(clean_r2) and os.path.getsize(clean_r2) > 0
 
 def check_quantification_completed(srr):
@@ -124,19 +191,20 @@ def check_quantification_completed(srr):
 
 def download_sample(srr):
 	"""Download a single sample using wget"""
-	print(f"[DOWNLOAD] Starting download of {srr}...")
+	logger = logging.getLogger(__name__)
+	logger.info(f"Starting download of {srr}")
 	
 	try:
 		# Download R1 and R2 files using wget
-		r1_url = f"{args.base_url}/{srr}_1.fastq.gz"
-		r2_url = f"{args.base_url}/{srr}_2.fastq.gz"
+		r1_url = f"{args.base_url}{srr}_1.fastq.gz"
+		r2_url = f"{args.base_url}{srr}_2.fastq.gz"
 		
 		r1_output = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
 		r2_output = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
 		
 		# Download R1
 		wget_cmd_r1 = [
-			"wget", "-c", "-O", r1_output, "--user=srruser", "--password=0x7p03lq",
+			"wget", "-c", "-O", r1_output, "--user", args.user, "--password", args.password,
 			"--progress=bar:force", "--timeout=600", "--tries=3", r1_url
 		]
 		
@@ -144,66 +212,42 @@ def download_sample(srr):
 			
 		if result_r1.returncode != 0:
 			if result_r1.returncode == 416:  # 416 means file already fully downloaded
-				print(f"[DOWNLOAD] ✓ {srr} R1 already downloaded, skipping...")
+				logger.info(f"{srr} R1 already downloaded, skipping")
 				pass
-			print(f"[DOWNLOAD] Error downloading R1 for {srr}: {result_r1.stderr}")
-			return False
+			else:
+				logger.error(f"Error downloading R1 for {srr}: {result_r1.stderr}")
+				return False
 		
 		# Download R2
 		wget_cmd_r2 = [
-			"wget", "-c", "-O", r2_output, "--user=srruser", "--password=0x7p03lq",
+			"wget", "-c", "-O", r2_output, "--user", args.user, "--password", args.password,
 			"--progress=bar:force", "--timeout=600", "--tries=3", r2_url
 		]
 		
 		result_r2 = subprocess.run(wget_cmd_r2, capture_output=True, text=True)
 		if result_r2.returncode != 0:
 			if result_r2.returncode == 416:  # 416 means file already fully downloaded
-				print(f"[DOWNLOAD] ✓ {srr} R2 already downloaded, skipping...")
+				logger.info(f"{srr} R2 already downloaded, skipping")
 				pass
-			print(f"[DOWNLOAD] Error downloading R2 for {srr}: {result_r2.stderr}")
-			if os.path.exists(r1_output):
-				os.remove(r1_output)
-			return False
+			else:
+				logger.error(f"Error downloading R2 for {srr}: {result_r2.stderr}")
+				if os.path.exists(r1_output):
+					os.remove(r1_output)
+				return False
 		
-		# Decompress files
-		#decomp_r1 = os.path.join(sample_dir, f"{srr}_1.fastq")
-		#decomp_r2 = os.path.join(sample_dir, f"{srr}_2.fastq")
-		
-		# Decompress R1
-		#with open(decomp_r1, 'w') as f:
-		#    gunzip_result_r1 = subprocess.run(["gunzip", "-c", r1_output], 
-		#                                    stdout=f, stderr=subprocess.PIPE, text=True)
-		#if gunzip_result_r1.returncode != 0:
-		#    print(f"[DOWNLOAD] Error decompressing R1 for {srr}")
-		#    return False
-		
-		# Decompress R2
-		#with open(decomp_r2, 'w') as f:
-		#    gunzip_result_r2 = subprocess.run(["gunzip", "-c", r2_output], 
-		#                                    stdout=f, stderr=subprocess.PIPE, text=True)
-		#if gunzip_result_r2.returncode != 0:
-		#    print(f"[DOWNLOAD] Error decompressing R2 for {srr}")
-		#    return False
-		
-		# Remove compressed files and move to final location
-		os.remove(r1_output)
-		os.remove(r2_output)
-		
-		#os.rename(decomp_r1, final_r1)
-		#os.rename(decomp_r2, final_r2)
-		
-		print(f"[DOWNLOAD] ✓ Successfully downloaded {srr}")
+		logger.info(f"Successfully downloaded {srr}")
 		update_stats('downloaded')
 		return True
 		
 	except Exception as e:
-		print(f"[DOWNLOAD] ✗ Failed to download {srr}: {str(e)}")
+		logger.error(f"Failed to download {srr}: {str(e)}")
 		update_stats('failed_downloads')
 		return False
 
 def fastqc_worker():
 	"""Worker for FastQC processing"""
 	global active_fastqc_workers
+	logger = logging.getLogger(__name__)
 	
 	while not pipeline_shutdown.is_set():
 		try:
@@ -215,30 +259,30 @@ def fastqc_worker():
 				active_fastqc_workers += 1
 				
 			if check_fastqc_completed(srr):
-				print(f"[FASTQC] ✓ {srr} FastQC already completed, skipping...")
+				logger.info(f"FastQC already completed for {srr}, skipping")
 				update_stats('fastqc_completed')
 				bbduk_queue.put(srr)  # Move to next stage
 			else:
-				print(f"[FASTQC] Starting FastQC for {srr}...")
+				logger.info(f"Starting FastQC for {srr}")
 				
-				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq")
-				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq")
+				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
+				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
 				
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
-					print(f"[FASTQC] ✗ Raw files not found for {srr}")
+					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
 				else:
 					# Run FastQC
 					success = True
 					for fastq_file in [r1_file, r2_file]:
-						fastqc_cmd = ["fastqc", fastq_file, "-o", fastqc_dir, "--quiet"]
+						fastqc_cmd = [args.fastqc_path, fastq_file, "-o", fastqc_dir, "--threads", "4", "--quiet"]
 						fastqc_result = subprocess.run(fastqc_cmd, capture_output=True, text=True)
 						if fastqc_result.returncode != 0:
-							print(f"[FASTQC] Warning: FastQC failed for {os.path.basename(fastq_file)}")
+							logger.warning(f"FastQC failed for {os.path.basename(fastq_file)}: {fastqc_result.stderr}")
 							success = False
 					
 					if success:
-						print(f"[FASTQC] ✓ FastQC completed for {srr}")
+						logger.info(f"FastQC completed for {srr}")
 						update_stats('fastqc_completed')
 						bbduk_queue.put(srr)  # Move to next stage
 					else:
@@ -252,13 +296,14 @@ def fastqc_worker():
 		except queue.Empty:
 			continue
 		except Exception as e:
-			print(f"[FASTQC] ✗ Error in FastQC worker: {str(e)}")
+			logger.error(f"Error in FastQC worker: {str(e)}")
 			with worker_lock:
 				active_fastqc_workers -= 1
 
 def bbduk_worker():
 	"""Worker for BBduk cleaning"""
 	global active_bbduk_workers
+	logger = logging.getLogger(__name__)
 	
 	while not pipeline_shutdown.is_set():
 		try:
@@ -270,36 +315,64 @@ def bbduk_worker():
 				active_bbduk_workers += 1
 				
 			if check_cleaning_completed(srr):
-				print(f"[BBDUK] ✓ {srr} cleaning already completed, skipping...")
+				logger.info(f"BBduk cleaning already completed for {srr}, skipping")
 				update_stats('cleaned')
 				salmon_queue.put(srr)  # Move to next stage
 			else:
-				print(f"[BBDUK] Starting cleaning for {srr}...")
+				logger.info(f"Starting BBduk cleaning for {srr}")
 				
-				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq")
-				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq")
+				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
+				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
 				
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
-					print(f"[BBDUK] ✗ Raw files not found for {srr}")
+					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
 				else:
-					clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq")
-					clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq")
+					clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
+					clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
 					
 					bbduk_cmd = [
-						"bbduk.sh", f"in1={r1_file}", f"in2={r2_file}",
+						args.bbduk_path, f"in1={r1_file}", f"in2={r2_file}",
 						f"out1={clean_r1}", f"out2={clean_r2}",
 						"ref=adapters", "ktrim=r", "k=23", "mink=11", "hdist=1",
-						"tpe", "tbo", "qtrim=rl", "trimq=10", "minlen=50",
-						"threads=1"
+						"tpe", "tbo", "qtrim=rl", "trimq=10", "minlen=50", "ftm=5",
+						"threads=4"
 					]
 					
 					bbduk_result = subprocess.run(bbduk_cmd, capture_output=True, text=True)
 					if bbduk_result.returncode != 0:
-						print(f"[BBDUK] ✗ Error cleaning {srr}: {bbduk_result.stderr}")
+						logger.error(f"Error cleaning {srr}: {bbduk_result.stderr}")
 						update_stats('failed_processing')
 					else:
-						print(f"[BBDUK] ✓ Successfully cleaned {srr}")
+						# Extract BBduk statistics from stderr
+						reads_in, reads_out = 0, 0
+						for line in bbduk_result.stderr.split('\n'):
+							if 'Input:' in line and 'reads' in line:
+								parts = line.split()
+								for i, part in enumerate(parts):
+									if part.isdigit() and 'reads' in parts[i+1]:
+										reads_in = int(part)
+										break
+							elif 'Result:' in line and 'reads' in line:
+								parts = line.split()
+								for i, part in enumerate(parts):
+									if part.isdigit() and 'reads' in parts[i+1]:
+										reads_out = int(part)
+										break
+						
+						retention_rate = (reads_out / reads_in * 100) if reads_in > 0 else 0
+						logger.info(f"Successfully cleaned {srr} - Input: {reads_in:,} reads, Output: {reads_out:,} reads ({retention_rate:.1f}% retained)")
+						
+						# Remove original compressed files after successful cleaning
+						try:
+							if os.path.exists(r1_file):
+								os.remove(r1_file)
+							if os.path.exists(r2_file):
+								os.remove(r2_file)
+							logger.debug(f"Removed original files for {srr}")
+						except Exception as e:
+							logger.warning(f"Could not remove original files for {srr}: {e}")
+						
 						update_stats('cleaned')
 						salmon_queue.put(srr)  # Move to next stage
 						
@@ -311,13 +384,14 @@ def bbduk_worker():
 		except queue.Empty:
 			continue
 		except Exception as e:
-			print(f"[BBDUK] ✗ Error in BBduk worker: {str(e)}")
+			logger.error(f"Error in BBduk worker: {str(e)}")
 			with worker_lock:
 				active_bbduk_workers -= 1
 
 def salmon_worker():
 	"""Worker for Salmon quantification"""
 	global active_salmon_workers
+	logger = logging.getLogger(__name__)
 	
 	while not pipeline_shutdown.is_set():
 		try:
@@ -329,49 +403,62 @@ def salmon_worker():
 				active_salmon_workers += 1
 				
 			if check_quantification_completed(srr):
-				print(f"[SALMON] ✓ {srr} quantification already completed, skipping...")
+				logger.info(f"Salmon quantification already completed for {srr}, skipping")
 				update_stats('quantified')
 			else:
 				# Wait for index to be built
 				salmon_index_built.wait()
 				
-				print(f"[SALMON] Starting quantification for {srr}...")
+				logger.info(f"Starting Salmon quantification for {srr}")
 				
-				clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq")
-				clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq")
+				clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
+				clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
 				
 				if not (os.path.exists(clean_r1) and os.path.exists(clean_r2)):
-					print(f"[SALMON] ✗ Clean files not found for {srr}")
+					logger.error(f"Clean files not found for {srr}")
 					update_stats('failed_processing')
 				else:
 					sample_output = os.path.join(salmon_results_dir, srr)
 					
 					salmon_quant_cmd = [
-						"salmon", "quant", "-i", salmon_index_dir, "-l", "A",
+						args.salmon_path, "quant", "-i", salmon_index_dir, "-l", "A",
 						"-1", clean_r1, "-2", clean_r2,
-						"-p", "1", "-o", sample_output
+						"-p", "4", "--validateMappings", "--seqBias", "--gcBias",
+						"-o", sample_output
 					]
 					
 					quant_result = subprocess.run(salmon_quant_cmd, capture_output=True, text=True)
 					if quant_result.returncode != 0:
-						print(f"[SALMON] ✗ Error quantifying {srr}: {quant_result.stderr}")
+						logger.error(f"Error quantifying {srr}: {quant_result.stderr}")
 						update_stats('failed_processing')
 					else:
-						print(f"[SALMON] ✓ Successfully quantified {srr}")
+						# Extract Salmon statistics from stderr
+						lib_type, mapping_rate = "Unknown", 0.0
+						for line in quant_result.stderr.split('\n'):
+							if 'library type' in line.lower() or 'detected library type' in line.lower():
+								parts = line.split()
+								for i, part in enumerate(parts):
+									if part.upper() in ['ISF', 'ISR', 'IU', 'MSF', 'MSR', 'MU', 'OSF', 'OSR', 'OU', 'SF', 'SR', 'U']:
+										lib_type = part.upper()
+										break
+							elif 'mapping rate' in line.lower():
+								import re
+								match = re.search(r'(\d+\.?\d*)%', line)
+								if match:
+									mapping_rate = float(match.group(1))
+						
+						logger.info(f"Successfully quantified {srr} - Library: {lib_type}, Mapping rate: {mapping_rate:.1f}%")
 						update_stats('quantified')
 						
-						# Clean up raw files for this sample to save space
-						r1_file = os.path.join(raw_dir, f"{srr}_1.fastq")
-						r2_file = os.path.join(raw_dir, f"{srr}_2.fastq")
-						
+						# Clean up cleaned files after successful quantification
 						try:
-							if os.path.exists(r1_file):
-								os.remove(r1_file)
-							if os.path.exists(r2_file):
-								os.remove(r2_file)
-							print(f"[CLEANUP] ✓ Removed raw files for {srr}")
+							if os.path.exists(clean_r1):
+								os.remove(clean_r1)
+							if os.path.exists(clean_r2):
+								os.remove(clean_r2)
+							logger.debug(f"Removed cleaned files for {srr}")
 						except Exception as e:
-							print(f"[CLEANUP] Warning: Could not remove raw files for {srr}: {e}")
+							logger.warning(f"Could not remove cleaned files for {srr}: {e}")
 							
 			with worker_lock:
 				active_salmon_workers -= 1
@@ -381,7 +468,7 @@ def salmon_worker():
 		except queue.Empty:
 			continue
 		except Exception as e:
-			print(f"[SALMON] ✗ Error in Salmon worker: {str(e)}")
+			logger.error(f"Error in Salmon worker: {str(e)}")
 			with worker_lock:
 				active_salmon_workers -= 1
 
@@ -393,79 +480,81 @@ def get_available_slots():
 
 def build_salmon_index(species):
 	"""Build Salmon index in a separate thread"""
+	logger = logging.getLogger(__name__)
+	
 	# Check if index already exists
 	index_info_file = os.path.join(salmon_index_dir, species, "info.json")
 	if os.path.exists(index_info_file):
-		print("[INDEX] ✓ Salmon index already exists, skipping build...")
+		logger.info("Salmon index already exists, skipping build")
 		salmon_index_built.set()  # Signal that index is ready
 		return
 	
-	print(f"[INDEX] Building Salmon index for species: {species}...")
+	logger.info(f"Building Salmon index for species: {species}")
 	
 	if not os.path.exists(args.transcripts):
-		print(f"[INDEX] ✗ Transcriptome file not found: {args.transcripts}")
+		logger.error(f"Transcriptome file not found: {args.transcripts}")
 		sys.exit(1)
 	
-	salmon_index_cmd = [
-		"salmon", "index", "-t", args.transcripts, "-i", f"{salmon_index_dir}/{species}"
-	]
+	# Build index command
+	salmon_index_cmd = [args.salmon_path, "index", "-t", args.transcripts, "-i", f"{salmon_index_dir}/{species}"]
+	
+	# Add decoy if provided
+	if args.decoy:
+		if not os.path.exists(args.decoy):
+			logger.error(f"Decoy file not found: {args.decoy}")
+			sys.exit(1)
+		
+		# Create combined transcriptome + decoy file
+		combined_file = os.path.join(salmon_index_dir, f"{species}_combined.fa")
+		logger.info(f"Creating combined transcriptome + decoy file: {combined_file}")
+		
+		with open(combined_file, 'w') as out_f:
+			# Copy transcriptome
+			with open(args.transcripts, 'r') as trans_f:
+				out_f.write(trans_f.read())
+			# Copy decoy
+			with open(args.decoy, 'r') as decoy_f:
+				out_f.write(decoy_f.read())
+		
+		# Create decoy names file
+		decoy_names_file = os.path.join(salmon_index_dir, f"{species}_decoys.txt")
+		with open(decoy_names_file, 'w') as decoy_f:
+			with open(args.decoy, 'r') as input_f:
+				for line in input_f:
+					if line.startswith('>'):
+						decoy_name = line[1:].split()[0]  # Remove '>' and get first part
+						decoy_f.write(f"{decoy_name}\n")
+		
+		# Update command to use combined file and decoy names
+		salmon_index_cmd = [
+			args.salmon_path, "index", "-t", combined_file, "-i", f"{salmon_index_dir}/{species}",
+			"-d", decoy_names_file
+		]
+		logger.info(f"Using decoy sequences from: {args.decoy}")
 	
 	index_result = subprocess.run(salmon_index_cmd, capture_output=True, text=True)
 	if index_result.returncode != 0:
-		print(f"[INDEX] ✗ Error building Salmon index: {index_result.stderr}")
+		logger.error(f"Error building Salmon index: {index_result.stderr}")
 		sys.exit(1)
 	
-	print("[INDEX] ✓ Salmon index successfully created!")
+	logger.info("Salmon index successfully created")
 	salmon_index_built.set()  # Signal that index is ready
 
 # Main pipeline execution
-print("=" * 80)
-print("ORDERED PIPELINE RNA-SEQ PROCESSING")
-print("=" * 80)
-print(f"Total species: {len(sra_ids)}")
-print(f"Parallel jobs: {args.parallel_jobs}")
-print(f"Base URL: {args.base_url}")
-print("Pipeline order: Download (sequential) -> FastQC -> BBduk -> Salmon (all parallel)")
+logger.info("=" * 80)
+logger.info("ORDERED PIPELINE RNA-SEQ PROCESSING")
+logger.info("=" * 80)
+logger.info(f"Total species: {len(sra_ids)}")
+logger.info(f"Parallel jobs: {args.parallel_jobs}")
+logger.info(f"Base URL: {args.base_url}")
+logger.info("Pipeline structure:")
+logger.info("  Download: Sequential (one sample at a time)")
+logger.info("  Processing: Parallel per sample (FastQC → BBduk → Salmon)")
+logger.info("  Threads per tool: FastQC=4, BBduk=4, Salmon=4")
+logger.info(f"  Total concurrent samples: Up to {args.parallel_jobs}")
 
 # Check for existing results and show resume information
-print("\n" + "=" * 80)
-print("CHECKING EXISTING RESULTS")
-print("=" * 80)
-
-#already_downloaded = 0
-#already_fastqc = 0
-#already_cleaned = 0
-#already_quantified = 0
-#
-#for srr in sra_ids:
-#    #if check_download_completed(srr):
-#    #    already_downloaded += 1
-#    if check_fastqc_completed(srr):
-#        already_fastqc += 1
-#    if check_cleaning_completed(srr):
-#        already_cleaned += 1
-#    if check_quantification_completed(srr):
-#        already_quantified += 1
-#
-#print(f"Found existing results:")
-#print(f"  - Downloaded: {already_downloaded}/{len(sra_ids)} samples")
-#print(f"  - FastQC completed: {already_fastqc}/{len(sra_ids)} samples")
-#print(f"  - Cleaned: {already_cleaned}/{len(sra_ids)} samples")
-#print(f"  - Quantified: {already_quantified}/{len(sra_ids)} samples")
-#
-#if already_quantified == len(sra_ids):
-#    print(f"\n✓ All samples already fully processed! Skipping to merge step...")
-#    # Update stats with existing results
-#    processing_stats['downloaded'] = already_downloaded
-#    processing_stats['fastqc_completed'] = already_fastqc
-#    processing_stats['cleaned'] = already_cleaned
-#    processing_stats['quantified'] = already_quantified
-#    # Set index as built (assume it exists if quantification is done)
-#    salmon_index_built.set()
-#else:
-#    print(f"\n→ Will process {len(sra_ids) - already_quantified} remaining samples")
-
-print("=" * 80)
+logger.info("CHECKING EXISTING RESULTS")
 
 # Start building Salmon index in background
 index_thread = threading.Thread(target=build_salmon_index, args=(list(sra_ids.keys())[0],))
@@ -473,7 +562,8 @@ index_thread.daemon = True
 index_thread.start()
 
 # Start workers for parallel processing
-print("\n[WORKERS] Starting worker threads...")
+logger.info("Starting worker threads")
+logger.info(f"Architecture: {args.parallel_jobs} parallel samples × 3 stages (FastQC/BBduk/Salmon) × 4 threads each")
 workers = []
 
 # Start worker threads for each stage
@@ -496,39 +586,38 @@ for _ in range(int(args.parallel_jobs)):
 	worker.start()
 	workers.append(worker)
 
-print(f"[WORKERS] Started {len(workers)} worker threads")
+logger.info(f"Started {len(workers)} worker threads")
 
 # Main pipeline execution - Sequential download with ordered parallel processing
-#if already_quantified < len(sra_ids):
-print("\n[PIPELINE] Starting sequential download and ordered parallel processing...")
+logger.info("Starting sequential download and ordered parallel processing")
 
 for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 	for srr in srr_list:
 		# Skip if already fully processed
 		if check_quantification_completed(srr):
-			print(f"[PIPELINE] ✓ {srr} already fully processed, skipping...")
+			logger.info(f"{srr} already fully processed, skipping")
 			continue
 
-		print(f"\n[PIPELINE] Processing sample {i}/{len(sra_ids)}: {srr}")
+		logger.info(f"Processing sample {i}/{len(sra_ids)}: {srr}")
 
 		# Download sequentially (only if not already downloaded)
 		if download_sample(srr):
 			# Add to FastQC queue for parallel processing
 			if not check_fastqc_completed(srr):
 				fastqc_queue.put(srr)
-				print(f"[PIPELINE] ✓ {srr} added to FastQC queue")
+				logger.info(f"{srr} added to FastQC queue")
 				# TODO put quality requirements check here
 			elif not check_cleaning_completed(srr):
 				bbduk_queue.put(srr)
-				print(f"[PIPELINE] ✓ {srr} added to BBduk queue (FastQC already done)")
+				logger.info(f"{srr} added to BBduk queue (FastQC already done)")
 			elif not check_quantification_completed(srr):
 				salmon_queue.put(srr)
-				print(f"[PIPELINE] ✓ {srr} added to Salmon queue (FastQC and BBduk already done)")
+				logger.info(f"{srr} added to Salmon queue (FastQC and BBduk already done)")
 		else:
-			print(f"[PIPELINE] ✗ {srr} download failed, skipping processing")
+			logger.error(f"{srr} download failed, skipping processing")
 
 # Wait for all queues to be processed
-print("\n[PIPELINE] Waiting for all processing to complete...")
+logger.info("Waiting for all processing to complete")
 
 # Monitor progress
 while (not fastqc_queue.empty() or 
@@ -539,18 +628,17 @@ while (not fastqc_queue.empty() or
 		active_salmon_workers > 0):
 	
 	with worker_lock:
-		print(f"[PROGRESS] Queues: FastQC={fastqc_queue.qsize()}, BBduk={bbduk_queue.qsize()}, Salmon={salmon_queue.qsize()}")
-		print(f"[PROGRESS] Active workers: FastQC={active_fastqc_workers}, BBduk={active_bbduk_workers}, Salmon={active_salmon_workers}")
+		total_queued = fastqc_queue.qsize() + bbduk_queue.qsize() + salmon_queue.qsize()
+		total_active = active_fastqc_workers + active_bbduk_workers + active_salmon_workers
+		logger.info(f"Progress - Queued: {total_queued} samples | Active: {total_active} workers")
+		logger.debug(f"Breakdown - FastQC: {fastqc_queue.qsize()}q/{active_fastqc_workers}w, BBduk: {bbduk_queue.qsize()}q/{active_bbduk_workers}w, Salmon: {salmon_queue.qsize()}q/{active_salmon_workers}w")
 	
 	time.sleep(5)  # Check every 5 seconds
 
-print("[PIPELINE] ✓ All processing completed!")
+logger.info("All processing completed")
 	
-#else:
-#    print("\n[PIPELINE] ✓ All samples already processed, skipping pipeline execution!")
-
 # Shutdown workers
-print("\n[WORKERS] Shutting down worker threads...")
+logger.info("Shutting down worker threads")
 pipeline_shutdown.set()
 
 # Send shutdown signals to queues
@@ -566,13 +654,11 @@ for worker in workers:
 # Wait for index building to complete
 index_thread.join()
 
-print("\n" + "=" * 80)
-print("MERGING QUANTIFICATION RESULTS")
-print("=" * 80)
+logger.info("MERGING QUANTIFICATION RESULTS")
 
 # Merge quantification results
 if processing_stats['quantified'] > 0:
-	print("Merging quantification results...")
+	logger.info("Merging quantification results")
 	
 	# Find all directories with quant.sf files
 	quant_dirs = []
@@ -584,7 +670,7 @@ if processing_stats['quantified'] > 0:
 	if quant_dirs:
 		# Merge TPM values
 		tpm_merge_cmd = [
-			"salmon", "quantmerge",
+			args.salmon_path, "quantmerge",
 			"--column", "TPM",
 			"--output", os.path.join(outdir, "merged_TPM.tsv"),
 			"--quants"
@@ -592,13 +678,13 @@ if processing_stats['quantified'] > 0:
 		
 		tpm_result = subprocess.run(tpm_merge_cmd, capture_output=True, text=True)
 		if tpm_result.returncode != 0:
-			print(f"[MERGE] ✗ Error merging TPM: {tpm_result.stderr}")
+			logger.error(f"Error merging TPM: {tpm_result.stderr}")
 		else:
-			print("[MERGE] ✓ TPM merge completed successfully")
+			logger.info("TPM merge completed successfully")
 		
 		# Merge count values
 		counts_merge_cmd = [
-			"salmon", "quantmerge",
+			args.salmon_path, "quantmerge",
 			"--column", "NumReads",
 			"--output", os.path.join(outdir, "merged_counts.tsv"),
 			"--quants"
@@ -606,16 +692,14 @@ if processing_stats['quantified'] > 0:
 		
 		counts_result = subprocess.run(counts_merge_cmd, capture_output=True, text=True)
 		if counts_result.returncode != 0:
-			print(f"[MERGE] ✗ Error merging counts: {counts_result.stderr}")
+			logger.error(f"Error merging counts: {counts_result.stderr}")
 		else:
-			print("[MERGE] ✓ Counts merge completed successfully")
+			logger.info("Counts merge completed successfully")
 
-print("\n" + "=" * 80)
-print("FINAL CLEANUP")
-print("=" * 80)
+logger.info("FINAL CLEANUP")
 
 # Clean up remaining raw and clean directories
-print("[CLEANUP] Removing remaining temporary files...")
+logger.info("Removing remaining temporary files")
 try:
 	if os.path.exists(raw_dir):
 		raw_size = sum(os.path.getsize(os.path.join(dirpath, filename))
@@ -623,32 +707,32 @@ try:
 						for filename in filenames) / (1024*1024)  # Size in MB
 		
 		shutil.rmtree(raw_dir)
-		print(f"[CLEANUP] ✓ Removed raw data directory ({raw_size:.1f} MB freed)")
+		logger.info(f"Removed raw data directory ({raw_size:.1f} MB freed)")
 		
 except Exception as e:
-	print(f"[CLEANUP] Warning: Error during cleanup: {e}")
+	logger.warning(f"Error during cleanup: {e}")
 
-print("\n" + "=" * 80)
-print("PIPELINE COMPLETED!")
-print("=" * 80)
+logger.info("=" * 80)
+logger.info("PIPELINE COMPLETED!")
+logger.info("=" * 80)
 
 # Final statistics
-print(f"Processing Statistics:")
-print(f"  Downloaded: {processing_stats['downloaded']}/{len(sra_ids)}")
-print(f"  FastQC completed: {processing_stats['fastqc_completed']}/{len(sra_ids)}")
-print(f"  Cleaned: {processing_stats['cleaned']}/{len(sra_ids)}")
-print(f"  Quantified: {processing_stats['quantified']}/{len(sra_ids)}")
-print(f"  Failed downloads: {processing_stats['failed_downloads']}")
-print(f"  Failed processing: {processing_stats['failed_processing']}")
+logger.info("Processing Statistics:")
+logger.info(f"  Downloaded: {processing_stats['downloaded']}/{len(sra_ids)}")
+logger.info(f"  FastQC completed: {processing_stats['fastqc_completed']}/{len(sra_ids)}")
+logger.info(f"  Cleaned: {processing_stats['cleaned']}/{len(sra_ids)}")
+logger.info(f"  Quantified: {processing_stats['quantified']}/{len(sra_ids)}")
+logger.info(f"  Failed downloads: {processing_stats['failed_downloads']}")
+logger.info(f"  Failed processing: {processing_stats['failed_processing']}")
 
-print(f"\nResults directory: {outdir}")
+logger.info(f"Results directory: {outdir}")
 if processing_stats['downloaded'] > 0:
-	print(f"  - FastQC results: {fastqc_dir}")
-	print(f"  - Salmon quantification results: {salmon_results_dir}")
+	logger.info(f"  - FastQC results: {fastqc_dir}")
+	logger.info(f"  - Salmon quantification results: {salmon_results_dir}")
 	if os.path.exists(os.path.join(outdir, "merged_TPM.tsv")):
-		print(f"  - Merged TPM results: {os.path.join(outdir, 'merged_TPM.tsv')}")
+		logger.info(f"  - Merged TPM results: {os.path.join(outdir, 'merged_TPM.tsv')}")
 	if os.path.exists(os.path.join(outdir, "merged_counts.tsv")):
-		print(f"  - Merged counts results: {os.path.join(outdir, 'merged_counts.tsv')}")
+		logger.info(f"  - Merged counts results: {os.path.join(outdir, 'merged_counts.tsv')}")
 
 # Exit with appropriate code
 total_failures = processing_stats['failed_downloads'] + processing_stats['failed_processing']
