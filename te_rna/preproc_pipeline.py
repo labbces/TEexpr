@@ -18,15 +18,12 @@ Usage:
 import os
 import subprocess
 import argparse
-import glob
-import multiprocessing as mp
 import threading
 import queue
 import time
 import sys
 import shutil
 import logging
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 # Arguments
 parser = argparse.ArgumentParser()
@@ -168,6 +165,34 @@ def check_fastqc_completed(srr):
 	r2_html = os.path.join(fastqc_dir, f"{srr}_2_fastqc.html")
 	return os.path.exists(r1_html) and os.path.getsize(r1_html) > 0 and os.path.exists(r2_html) and os.path.getsize(r2_html) > 0
 
+def fastqc_passed_quality(srr):
+	"""Check if FastQC quality is sufficient (>80% good sequences) from HTML report"""
+	import re
+	r1_html = os.path.join(fastqc_dir, f"{srr}_1_fastqc.html")
+	r2_html = os.path.join(fastqc_dir, f"{srr}_2_fastqc.html")
+	def parse_html(file):
+		total = None
+		poor = None
+		if not os.path.exists(file):
+			return None, None
+		import re
+		for line in open(file):
+			# Exemplo: <tr><td>Total Sequences</td><td>23400214</td></tr>
+			m_total = re.search(r'<tr><td>Total Sequences</td><td>(\d+)</td></tr>', line)
+			if m_total:
+				total = int(m_total.group(1))
+			m_poor = re.search(r'<tr><td>Sequences flagged as poor quality</td><td>(\d+)</td></tr>', line)
+			if m_poor:
+				poor = int(m_poor.group(1))
+		return total, poor
+	t1, p1 = parse_html(r1_html)
+	t2, p2 = parse_html(r2_html)
+	if t1 is None or t2 is None or p1 is None or p2 is None:
+		return False
+	good1 = (t1 - p1) / t1 if t1 > 0 else 0
+	good2 = (t2 - p2) / t2 if t2 > 0 else 0
+	return good1 > 0.8 and good2 > 0.8
+
 def check_cleaning_completed(srr):
 	"""Check if BBduk cleaning is already completed for a sample"""
 	clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
@@ -251,7 +276,7 @@ def fastqc_worker():
 	
 	while not pipeline_shutdown.is_set():
 		try:
-			srr = fastqc_queue.get(timeout=1)
+			species, srr = fastqc_queue.get(timeout=1)
 			if srr is None:  # Shutdown signal
 				break
 				
@@ -261,7 +286,7 @@ def fastqc_worker():
 			if check_fastqc_completed(srr):
 				logger.info(f"FastQC already completed for {srr}, skipping")
 				update_stats('fastqc_completed')
-				bbduk_queue.put(srr)  # Move to next stage
+				bbduk_queue.put([species, srr])  # Move to next stage
 			else:
 				logger.info(f"Starting FastQC for {srr}")
 				
@@ -284,7 +309,7 @@ def fastqc_worker():
 					if success:
 						logger.info(f"FastQC completed for {srr}")
 						update_stats('fastqc_completed')
-						bbduk_queue.put(srr)  # Move to next stage
+						bbduk_queue.put([species, srr])  # Move to next stage
 					else:
 						update_stats('failed_processing')
 						
@@ -307,7 +332,7 @@ def bbduk_worker():
 	
 	while not pipeline_shutdown.is_set():
 		try:
-			srr = bbduk_queue.get(timeout=1)
+			species, srr = bbduk_queue.get(timeout=1)
 			if srr is None:  # Shutdown signal
 				break
 				
@@ -317,7 +342,7 @@ def bbduk_worker():
 			if check_cleaning_completed(srr):
 				logger.info(f"BBduk cleaning already completed for {srr}, skipping")
 				update_stats('cleaned')
-				salmon_queue.put(srr)  # Move to next stage
+				salmon_queue.put([species, srr])  # Move to next stage
 			else:
 				logger.info(f"Starting BBduk cleaning for {srr}")
 				
@@ -331,50 +356,45 @@ def bbduk_worker():
 					clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
 					clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
 					
-					bbduk_cmd = [
-						args.bbduk_path, f"in1={r1_file}", f"in2={r2_file}",
-						f"out1={clean_r1}", f"out2={clean_r2}",
-						"ref=adapters", "ktrim=r", "k=23", "mink=11", "hdist=1",
-						"tpe", "tbo", "qtrim=rl", "trimq=10", "minlen=50", "ftm=5",
-						"threads=4"
-					]
-					
-					bbduk_result = subprocess.run(bbduk_cmd, capture_output=True, text=True)
-					if bbduk_result.returncode != 0:
-						logger.error(f"Error cleaning {srr}: {bbduk_result.stderr}")
-						update_stats('failed_processing')
-					else:
-						# Extract BBduk statistics from stderr
-						reads_in, reads_out = 0, 0
-						for line in bbduk_result.stderr.split('\n'):
-							if 'Input:' in line and 'reads' in line:
-								parts = line.split()
-								for i, part in enumerate(parts):
-									if part.isdigit() and 'reads' in parts[i+1]:
-										reads_in = int(part)
-										break
-							elif 'Result:' in line and 'reads' in line:
-								parts = line.split()
-								for i, part in enumerate(parts):
-									if part.isdigit() and 'reads' in parts[i+1]:
-										reads_out = int(part)
-										break
-						
-						retention_rate = (reads_out / reads_in * 100) if reads_in > 0 else 0
-						logger.info(f"Successfully cleaned {srr} - Input: {reads_in:,} reads, Output: {reads_out:,} reads ({retention_rate:.1f}% retained)")
-						
-						# Remove original compressed files after successful cleaning
-						try:
-							if os.path.exists(r1_file):
-								os.remove(r1_file)
-							if os.path.exists(r2_file):
-								os.remove(r2_file)
-							logger.debug(f"Removed original files for {srr}")
-						except Exception as e:
-							logger.warning(f"Could not remove original files for {srr}: {e}")
-						
-						update_stats('cleaned')
-						salmon_queue.put(srr)  # Move to next stage
+					for r_file, clean_r in [(r1_file, clean_r1), (r2_file, clean_r2)]:
+						bbduk_cmd = [
+							args.bbduk_path, f"in={r_file}", f"out={clean_r}", "threads=4"
+						]
+
+						bbduk_result = subprocess.run(bbduk_cmd, capture_output=True, text=True)
+						if bbduk_result.returncode != 0:
+							logger.error(f"Error cleaning {srr}: {bbduk_result.stderr}")
+							update_stats('failed_processing')
+						else:
+							# Extract BBduk statistics from stderr
+							reads_in, reads_out = 0, 0
+							for line in bbduk_result.stderr.split('\n'):
+								if 'Input:' in line and 'reads' in line:
+									parts = line.split()
+									for i, part in enumerate(parts):
+										if part.isdigit() and 'reads' in parts[i+1]:
+											reads_in = int(part)
+											break
+								elif 'Result:' in line and 'reads' in line:
+									parts = line.split()
+									for i, part in enumerate(parts):
+										if part.isdigit() and 'reads' in parts[i+1]:
+											reads_out = int(part)
+											break
+										
+							retention_rate = (reads_out / reads_in * 100) if reads_in > 0 else 0
+							logger.info(f"Successfully cleaned {srr} - Input: {reads_in:,} reads, Output: {reads_out:,} reads ({retention_rate:.1f}% retained)")
+
+							# Remove original compressed files after successful cleaning
+							try:
+								if os.path.exists(r_file):
+									os.remove(r_file)
+								logger.debug(f"Removed original files for {srr}")
+							except Exception as e:
+								logger.warning(f"Could not remove original files for {srr}: {e}")
+
+							update_stats('cleaned')
+							salmon_queue.put([species, srr])  # Move to next stage
 						
 			with worker_lock:
 				active_bbduk_workers -= 1
@@ -395,7 +415,7 @@ def salmon_worker():
 	
 	while not pipeline_shutdown.is_set():
 		try:
-			srr = salmon_queue.get(timeout=1)
+			species, srr = salmon_queue.get(timeout=1)
 			if srr is None:  # Shutdown signal
 				break
 				
@@ -421,7 +441,7 @@ def salmon_worker():
 					sample_output = os.path.join(salmon_results_dir, srr)
 					
 					salmon_quant_cmd = [
-						args.salmon_path, "quant", "-i", salmon_index_dir, "-l", "A",
+						args.salmon_path, "quant", "-i", f"{salmon_index_dir}/{species}", "-l", "A",
 						"-1", clean_r1, "-2", clean_r2,
 						"-p", "4", "--validateMappings", "--seqBias", "--gcBias",
 						"-o", sample_output
@@ -600,19 +620,36 @@ for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 
 		logger.info(f"Processing sample {i}/{len(sra_ids)}: {srr}")
 
-		# Download sequentially (only if not already downloaded)
-		if download_sample(srr):
-			# Add to FastQC queue for parallel processing
-			if not check_fastqc_completed(srr):
-				fastqc_queue.put(srr)
-				logger.info(f"{srr} added to FastQC queue")
-				# TODO put quality requirements check here
-			elif not check_cleaning_completed(srr):
-				bbduk_queue.put(srr)
-				logger.info(f"{srr} added to BBduk queue (FastQC already done)")
+		# Se já existe FastQC, não baixa, só manda para o BBduk (se passar critério)
+		if check_fastqc_completed(srr):
+			logger.info(f"{srr} FastQC already exists, skipping download and FastQC step")
+			if not check_cleaning_completed(srr):
+				if fastqc_passed_quality(srr):
+					bbduk_queue.put([species, srr])
+					logger.info(f"{srr} added to BBduk queue (FastQC passed quality)")
+				else:
+					logger.warning(f"{srr} did not pass FastQC quality threshold (>80% good sequences), skipping BBduk and Salmon")
 			elif not check_quantification_completed(srr):
-				salmon_queue.put(srr)
-				logger.info(f"{srr} added to Salmon queue (FastQC and BBduk already done)")
+				if check_cleaning_completed(srr):
+					salmon_queue.put([species, srr])
+					logger.info(f"{srr} added to Salmon queue (BBduk completed)")
+			continue
+
+		# Download sequencialmente (apenas se não existe FastQC)
+		if download_sample(srr):
+			if not check_fastqc_completed(srr):
+				fastqc_queue.put([species, srr])
+				logger.info(f"{srr} added to FastQC queue")
+			elif not check_cleaning_completed(srr):
+				if fastqc_passed_quality(srr):
+					bbduk_queue.put([species, srr])
+					logger.info(f"{srr} added to BBduk queue (FastQC passed quality)")
+				else:
+					logger.warning(f"{srr} did not pass FastQC quality threshold (>80% good sequences), skipping BBduk and Salmon")
+			elif not check_quantification_completed(srr):
+				if check_cleaning_completed(srr):
+					salmon_queue.put([species, srr])
+					logger.info(f"{srr} added to Salmon queue (BBduk completed)")
 		else:
 			logger.error(f"{srr} download failed, skipping processing")
 
@@ -643,9 +680,9 @@ pipeline_shutdown.set()
 
 # Send shutdown signals to queues
 for _ in range(int(args.parallel_jobs)):
-	fastqc_queue.put(None)
-	bbduk_queue.put(None)
-	salmon_queue.put(None)
+	fastqc_queue.put(None, None)
+	bbduk_queue.put(None, None)
+	salmon_queue.put(None, None)
 
 # Wait for workers to finish
 for worker in workers:
