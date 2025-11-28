@@ -343,27 +343,30 @@ def bbduk_worker():
 				logger.info(f"BBduk cleaning already completed for {srr}, skipping")
 				update_stats('cleaned')
 				salmon_queue.put([species, srr])  # Move to next stage
+
 			else:
 				logger.info(f"Starting BBduk cleaning for {srr}")
-				
+
 				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
 				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
-				
+
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
 					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
 				else:
 					clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
 					clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
-					
-					for r_file, clean_r in [(r1_file, clean_r1), (r2_file, clean_r2)]:
+
+					success_r1 = False
+					success_r2 = False
+					for idx, (r_file, clean_r) in enumerate([(r1_file, clean_r1), (r2_file, clean_r2)]):
 						bbduk_cmd = [
 							args.bbduk_path, f"in={r_file}", f"out={clean_r}", "threads=4"
 						]
 
 						bbduk_result = subprocess.run(bbduk_cmd, capture_output=True, text=True)
 						if bbduk_result.returncode != 0:
-							logger.error(f"Error cleaning {srr}: {bbduk_result.stderr}")
+							logger.error(f"Error cleaning {srr} ({'R1' if idx==0 else 'R2'}): {bbduk_result.stderr}")
 							update_stats('failed_processing')
 						else:
 							# Extract BBduk statistics from stderr
@@ -381,20 +384,27 @@ def bbduk_worker():
 										if part.isdigit() and 'reads' in parts[i+1]:
 											reads_out = int(part)
 											break
-										
+
 							retention_rate = (reads_out / reads_in * 100) if reads_in > 0 else 0
-							logger.info(f"Successfully cleaned {srr} - Input: {reads_in:,} reads, Output: {reads_out:,} reads ({retention_rate:.1f}% retained)")
+							logger.info(f"Successfully cleaned {srr} ({'R1' if idx==0 else 'R2'}) - Input: {reads_in:,} reads, Output: {reads_out:,} reads ({retention_rate:.1f}% retained)")
 
 							# Remove original compressed files after successful cleaning
 							try:
 								if os.path.exists(r_file):
 									os.remove(r_file)
-								logger.debug(f"Removed original files for {srr}")
+								logger.debug(f"Removed original files for {srr} ({'R1' if idx==0 else 'R2'})")
 							except Exception as e:
-								logger.warning(f"Could not remove original files for {srr}: {e}")
+								logger.warning(f"Could not remove original files for {srr} ({'R1' if idx==0 else 'R2'}): {e}")
 
-							update_stats('cleaned')
-							salmon_queue.put([species, srr])  # Move to next stage
+							if idx == 0:
+								success_r1 = True
+							else:
+								success_r2 = True
+
+					# Só atualiza stats e adiciona na salmon_queue se ambos foram limpos com sucesso
+					if success_r1 and success_r2:
+						update_stats('cleaned')
+						salmon_queue.put([species, srr])  # Move to next stage
 						
 			with worker_lock:
 				active_bbduk_workers -= 1
@@ -657,19 +667,23 @@ for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 logger.info("Waiting for all processing to complete")
 
 # Monitor progress
+prev_queued = None
+prev_active = None
 while (not fastqc_queue.empty() or 
 		not bbduk_queue.empty() or 
 		not salmon_queue.empty() or
 		active_fastqc_workers > 0 or 
 		active_bbduk_workers > 0 or 
 		active_salmon_workers > 0):
-	
+
 	with worker_lock:
 		total_queued = fastqc_queue.qsize() + bbduk_queue.qsize() + salmon_queue.qsize()
 		total_active = active_fastqc_workers + active_bbduk_workers + active_salmon_workers
-		logger.info(f"Progress - Queued: {total_queued} samples | Active: {total_active} workers")
-		logger.debug(f"Breakdown - FastQC: {fastqc_queue.qsize()}q/{active_fastqc_workers}w, BBduk: {bbduk_queue.qsize()}q/{active_bbduk_workers}w, Salmon: {salmon_queue.qsize()}q/{active_salmon_workers}w")
-	
+		if total_queued != prev_queued or total_active != prev_active:
+			logger.info(f"Progress - Queued: {total_queued} samples | Active: {total_active} workers")
+			logger.debug(f"Breakdown - FastQC: {fastqc_queue.qsize()}q/{active_fastqc_workers}w, BBduk: {bbduk_queue.qsize()}q/{active_bbduk_workers}w, Salmon: {salmon_queue.qsize()}q/{active_salmon_workers}w")
+			prev_queued = total_queued
+			prev_active = total_active
 	time.sleep(5)  # Check every 5 seconds
 
 logger.info("All processing completed")
