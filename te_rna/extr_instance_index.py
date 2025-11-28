@@ -41,19 +41,8 @@ def parse_repeatmasker_out(rm_path):
 					contig = fields[4]
 					start = int(fields[5]) - 1  # RM é base-1, Python é base-0
 					end = int(fields[6])
-					strand = '+'
-
-					# Determina a fita (strand) do TE
-					if fields[8] == 'C' or fields[8] == 'c':
-						strand = '-'
-						repeat_field_idx = 9
-					else:
-						if fields[8] in ('+', '-'):
-							strand = fields[8]
-							repeat_field_idx = 9
-						else:
-							repeat_field_idx = 8
-					name = fields[repeat_field_idx]
+					strand = fields[8]
+					name = fields[9]
 
 					# Adiciona ao resultado
 					rows.append({
@@ -115,9 +104,14 @@ if __name__ == '__main__':
 	if args.repeatmasker:
 		print('Parsing RepeatMasker .out...')
 		df = parse_repeatmasker_out(args.repeatmasker)
-	else:
+
+	elif args.bed:
 		print('Parsing BED...')
 		df = parse_bed(args.bed)
+
+	else:
+		print("ERRO: Nenhum arquivo RepeatMasker ou BED fornecido (isso não deveria ocorrer).")
+		sys.exit(1)
 
 	# Filtrar por regex (nome do TE)
 	if args.filter:
@@ -156,20 +150,33 @@ if __name__ == '__main__':
 		try:
 			# Extrai sequência do genoma
 			seq_obj = genome[row.Chromosome].seq[row.Start:row.End]
+			
 		except KeyError:
 			# Se cromossomo não existe, ignora
 			print(f"Contig {row.Chromosome} não encontrado no genoma. Pulando {copy_id}", file=sys.stderr)
 			continue
 
-		# Aplica reverse complement se necessário
-		if row.Strand == '-':
-			seq_obj = seq_obj.reverse_complement()
-
+		# Converte para string antes de qualquer processamento
 		seq = str(seq_obj)
 		seqlen = len(seq)
+
 		# Ignora instâncias curtas
 		if seqlen < args.min_length:
 			continue
+
+		# Aplica reverse complement se necessário
+		if row.Strand == '-':
+			seq = str(seq_obj.reverse_complement())
+
+		# Criar SeqRecord com a sequência final (processada)
+		records.append(
+			SeqRecord(
+				seq=seq,
+				id=copy_id,
+				description=f"family={row.TE_name} location={row.Chromosome}:{row.Start+1}-{row.End}({row.Strand})"
+			)
+		)
+
 		# Cria registro FASTA e metadados
 		records.append(SeqRecord(seq_obj, id=copy_id, description=f"family={row.TE_name} location={row.Chromosome}:{row.Start+1}-{row.End}({row.Strand})"))
 		tsv_lines.append(f"{copy_id}\t{row.TE_name}\t{row.Chromosome}\t{row.Start+1}\t{row.End}\t{row.Strand}\t{seqlen}")
@@ -188,11 +195,3 @@ if __name__ == '__main__':
 		for line in map_lines:
 			f.write(line + '\n')
 	print('Arquivos gerados com sucesso.')
-
-	# Comandos sugeridos para uso com Salmon
-	salmon_index_cmd = f"salmon index -t {args.out_fasta} -i salmon_index_TEgenomic -k 31 --transcript-to-gene-map {args.out_fasta}.transcript_to_gene_map.tsv"
-	salmon_quant_cmd = "salmon quant -i salmon_index_TEgenomic -l A -1 <reads_R1.fastq.gz> -2 <reads_R2.fastq.gz> -o <sample_TEgenomic_quant>"
-
-	print('\nSuggested Salmon commands:')
-	print(salmon_index_cmd)
-	print(salmon_quant_cmd)
