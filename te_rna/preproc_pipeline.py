@@ -114,6 +114,8 @@ os.makedirs(fastqc_dir, exist_ok=True)
 os.makedirs(clean_dir, exist_ok=True)
 os.makedirs(salmon_index_dir, exist_ok=True)
 os.makedirs(salmon_results_dir, exist_ok=True)
+error_dir = os.path.join(outdir, "error")
+os.makedirs(error_dir, exist_ok=True)
 
 # Initialize logging
 logger = setup_logging(outdir)
@@ -289,29 +291,60 @@ def fastqc_worker():
 				bbduk_queue.put([species, srr])  # Move to next stage
 			else:
 				logger.info(f"Starting FastQC for {srr}")
-				
+
 				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
 				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
-				
+
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
 					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
+					# Salva erro
+					error_file = os.path.join(error_dir, f"{srr}_fastqc_error.txt")
+					try:
+						with open(error_file, 'w') as ef:
+							ef.write("Raw files not found for FastQC\n")
+					except Exception as e:
+						logger.warning(f"Could not write FastQC error file for {srr}: {e}")
+					# Remove raw data
+					for f in [r1_file, r2_file]:
+						try:
+							if os.path.exists(f):
+								os.remove(f)
+								logger.debug(f"Removed raw file after FastQC error: {f}")
+						except Exception as e:
+							logger.warning(f"Could not remove raw file {f} after FastQC error: {e}")
 				else:
 					# Run FastQC
 					success = True
+					fastqc_errors = ""
 					for fastq_file in [r1_file, r2_file]:
 						fastqc_cmd = [args.fastqc_path, fastq_file, "-o", fastqc_dir, "--threads", "4", "--quiet"]
 						fastqc_result = subprocess.run(fastqc_cmd, capture_output=True, text=True)
 						if fastqc_result.returncode != 0:
 							logger.warning(f"FastQC failed for {os.path.basename(fastq_file)}: {fastqc_result.stderr}")
 							success = False
-					
+							fastqc_errors += f"FastQC failed for {os.path.basename(fastq_file)}: {fastqc_result.stderr}\n"
 					if success:
 						logger.info(f"FastQC completed for {srr}")
 						update_stats('fastqc_completed')
 						bbduk_queue.put([species, srr])  # Move to next stage
 					else:
 						update_stats('failed_processing')
+						# Salva erro
+						error_file = os.path.join(error_dir, f"{srr}_fastqc_error.txt")
+						try:
+							with open(error_file, 'w') as ef:
+								ef.write(fastqc_errors)
+						except Exception as e:
+							logger.warning(f"Could not write FastQC error file for {srr}: {e}")
+						# Remove raw data
+						for f in [r1_file, r2_file]:
+							try:
+								if os.path.exists(f):
+									os.remove(f)
+									logger.debug(f"Removed raw file after FastQC error: {f}")
+							except Exception as e:
+								logger.warning(f"Could not remove raw file {f} after FastQC error: {e}")
 						
 			with worker_lock:
 				active_fastqc_workers -= 1
@@ -353,6 +386,21 @@ def bbduk_worker():
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
 					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
+					# Salva erro
+					error_file = os.path.join(error_dir, f"{srr}_bbduk_error.txt")
+					try:
+						with open(error_file, 'w') as ef:
+							ef.write("Raw files not found for BBduk\n")
+					except Exception as e:
+						logger.warning(f"Could not write BBduk error file for {srr}: {e}")
+					# Remove raw data
+					for f in [r1_file, r2_file]:
+						try:
+							if os.path.exists(f):
+								os.remove(f)
+								logger.debug(f"Removed raw file after BBduk error: {f}")
+						except Exception as e:
+							logger.warning(f"Could not remove raw file {f} after BBduk error: {e}")
 				else:
 					clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
 					clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
@@ -368,6 +416,20 @@ def bbduk_worker():
 						if bbduk_result.returncode != 0:
 							logger.error(f"Error cleaning {srr} ({'R1' if idx==0 else 'R2'}): {bbduk_result.stderr}")
 							update_stats('failed_processing')
+							# Salva erro
+							error_file = os.path.join(error_dir, f"{srr}_bbduk_error.txt")
+							try:
+								with open(error_file, 'a') as ef:
+									ef.write(f"Error cleaning {srr} ({'R1' if idx==0 else 'R2'}): {bbduk_result.stderr}\n")
+							except Exception as e:
+								logger.warning(f"Could not write BBduk error file for {srr}: {e}")
+							# Remove raw data
+							try:
+								if os.path.exists(r_file):
+									os.remove(r_file)
+									logger.debug(f"Removed raw file after BBduk error: {r_file}")
+							except Exception as e:
+								logger.warning(f"Could not remove raw file {r_file} after BBduk error: {e}")
 						else:
 							# Extract BBduk statistics from stderr
 							reads_in, reads_out = 0, 0
@@ -435,32 +497,68 @@ def salmon_worker():
 			if check_quantification_completed(srr):
 				logger.info(f"Salmon quantification already completed for {srr}, skipping")
 				update_stats('quantified')
+				# Remove raw data
+				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
+				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
+				for f in [r1_file, r2_file]:
+					try:
+						if os.path.exists(f):
+							os.remove(f)
+							logger.debug(f"Removed raw file after Salmon: {f}")
+					except Exception as e:
+						logger.warning(f"Could not remove raw file {f} after Salmon: {e}")
 			else:
 				# Wait for index to be built
 				salmon_index_built.wait()
-				
+
 				logger.info(f"Starting Salmon quantification for {srr}")
-				
+
 				clean_r1 = os.path.join(clean_dir, f"{srr}_clean_1.fastq.gz")
 				clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
-				
+
+				r1_file = os.path.join(raw_dir, f"{srr}_1.fastq.gz")
+				r2_file = os.path.join(raw_dir, f"{srr}_2.fastq.gz")
+
 				if not (os.path.exists(clean_r1) and os.path.exists(clean_r2)):
 					logger.error(f"Clean files not found for {srr}")
 					update_stats('failed_processing')
+					# Remove raw data
+					for f in [r1_file, r2_file]:
+						try:
+							if os.path.exists(f):
+								os.remove(f)
+								logger.debug(f"Removed raw file after Salmon error: {f}")
+						except Exception as e:
+							logger.warning(f"Could not remove raw file {f} after Salmon error: {e}")
 				else:
 					sample_output = os.path.join(salmon_results_dir, srr)
-					
+
 					salmon_quant_cmd = [
 						args.salmon_path, "quant", "-i", f"{salmon_index_dir}/{species}", "-l", "A",
 						"-1", clean_r1, "-2", clean_r2,
 						"-p", "4", "--validateMappings", "--seqBias", "--gcBias",
 						"-o", sample_output
 					]
-					
+
 					quant_result = subprocess.run(salmon_quant_cmd, capture_output=True, text=True)
 					if quant_result.returncode != 0:
 						logger.error(f"Error quantifying {srr}: {quant_result.stderr}")
 						update_stats('failed_processing')
+						# Escreve erro em arquivo específico
+						error_file = os.path.join(error_dir, f"{srr}_salmon_error.txt")
+						try:
+							with open(error_file, 'w') as ef:
+								ef.write(quant_result.stderr)
+						except Exception as e:
+							logger.warning(f"Could not write error file for {srr}: {e}")
+						# Remove raw data
+						for f in [r1_file, r2_file]:
+							try:
+								if os.path.exists(f):
+									os.remove(f)
+									logger.debug(f"Removed raw file after Salmon error: {f}")
+							except Exception as e:
+								logger.warning(f"Could not remove raw file {f} after Salmon error: {e}")
 					else:
 						# Extract Salmon statistics from stderr
 						lib_type, mapping_rate = "Unknown", 0.0
@@ -476,10 +574,10 @@ def salmon_worker():
 								match = re.search(r'(\d+\.?\d*)%', line)
 								if match:
 									mapping_rate = float(match.group(1))
-						
+
 						logger.info(f"Successfully quantified {srr} - Library: {lib_type}, Mapping rate: {mapping_rate:.1f}%")
 						update_stats('quantified')
-						
+
 						# Clean up cleaned files after successful quantification
 						try:
 							if os.path.exists(clean_r1):
@@ -489,7 +587,14 @@ def salmon_worker():
 							logger.debug(f"Removed cleaned files for {srr}")
 						except Exception as e:
 							logger.warning(f"Could not remove cleaned files for {srr}: {e}")
-							
+						# Remove raw data
+						for f in [r1_file, r2_file]:
+							try:
+								if os.path.exists(f):
+									os.remove(f)
+									logger.debug(f"Removed raw file after Salmon: {f}")
+							except Exception as e:
+								logger.warning(f"Could not remove raw file {f} after Salmon: {e}")
 			with worker_lock:
 				active_salmon_workers -= 1
 				
