@@ -156,9 +156,15 @@ if __name__ == '__main__':
 			print(f"Contig {row.Chromosome} não encontrado no genoma. Pulando {copy_id}", file=sys.stderr)
 			continue
 
-		# Converte para string antes de qualquer processamento
-		seq = str(seq_obj)
-		seqlen = len(seq)
+		# Extrai sequência do genoma
+		try:
+			seq_obj = genome[row.Chromosome].seq[row.Start:row.End]
+		except KeyError:
+			print(f"Contig {row.Chromosome} não encontrado no genoma. Pulando {copy_id}", file=sys.stderr)
+			continue
+
+		# Tamanho direto da sequência (sem converter para string)
+		seqlen = len(seq_obj)
 
 		# Ignora instâncias curtas
 		if seqlen < args.min_length:
@@ -166,7 +172,7 @@ if __name__ == '__main__':
 
 		# Aplica reverse complement se necessário
 		if row.Strand == '-':
-			seq = str(seq_obj.reverse_complement())
+			seq_obj = seq_obj.reverse_complement()
 
 		# Criar SeqRecord com a sequência final (processada)
 		records.append(
