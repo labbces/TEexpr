@@ -54,7 +54,7 @@ blast_filt = blast[blast["cov_q"] >= args.min_cov]
 # -----------------------------
 
 # mapping = defaultdict(list)
-# mapping = defaultdict(set)
+mapping = defaultdict(set)
 
 for _, row in blast_filt.iterrows():
 #    mapping[row["representative"]].append(row["instance"])
