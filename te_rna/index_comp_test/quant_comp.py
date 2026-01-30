@@ -53,10 +53,12 @@ blast_filt = blast[blast["cov_q"] >= args.min_cov]
 # MAP INSTANCES TO REPRESENTATIVES
 # -----------------------------
 
-mapping = defaultdict(list)
+# mapping = defaultdict(list)
+# mapping = defaultdict(set)
 
 for _, row in blast_filt.iterrows():
-    mapping[row["representative"]].append(row["instance"])
+#    mapping[row["representative"]].append(row["instance"])
+    mapping[row["representative"]].add(row["instance"])
 
 # -----------------------------
 # SUM INSTANCE TPMs PER TE
