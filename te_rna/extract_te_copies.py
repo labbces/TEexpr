@@ -10,7 +10,7 @@ a FASTA suitable for quantification (e.g. Salmon), along with metadata TSV and
 Requirements:
     Python 3.8+
     biopython >= 1.79
-    pyranges >= 0.0.120
+    pyfaidx >= 0.7
     pandas
 
 Install dependencies:
