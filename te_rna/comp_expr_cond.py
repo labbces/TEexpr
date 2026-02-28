@@ -9,11 +9,11 @@ Steps:
 
 Usage example:
     python comp_expr_cond.py \\
-        --metadata   instances.fasta.tsv \\
-        --tpm_instances      tpm_instances.tsv \\
-        --tpm_representatives tpm_representatives.tsv \\
+        --metadata   EDTA_instances.fasta.tsv \\
+        --tpm_instances      EDTA_tpm_instances.tsv \\
+        --tpm_representatives EDTA_tpm_representatives.tsv \\
         --conditions conditions.tsv \\
-        --out        quant_comp.tsv
+        --out        EDTA_quant_comp.tsv
 """
 import argparse
 import pandas as pd
@@ -78,10 +78,11 @@ for cond, samples in cond_to_samples.items():
     repr_cond = tpm_repr[[s for s in samples if s in tpm_repr.columns]]
 
     for te in tpm_repr.index:
+        te_id = te.split("#")[0]  # strip #CLASS → "TE_00000778"
         tpm_rep_val = repr_cond.loc[te].mean() if te in repr_cond.index else 0.0
 
         tpm_inst_val = 0.0
-        for inst in mapping.get(te, []):
+        for inst in mapping.get(te_id, []):
             if inst in inst_cond.index:
                 tpm_inst_val += inst_cond.loc[inst].mean()
 
@@ -90,7 +91,7 @@ for cond, samples in cond_to_samples.items():
             "condition":               cond,
             "TPM_representative_mean": tpm_rep_val,
             "TPM_instances_mean":      tpm_inst_val,
-            "n_instances":             len(mapping.get(te, []))
+            "n_instances":             len(mapping.get(te_id, []))
         })
 
 out_df = pd.DataFrame(rows)
