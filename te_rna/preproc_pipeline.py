@@ -12,7 +12,7 @@ The pipeline works as follows:
 3. Processing steps (QC, cleaning, quantification) run in parallel with N workers
 
 Usage:
-	python pipeline_init.py --sra_list samples.txt --transcripts transcriptome.fa --outdir output --parallel_jobs 4
+	python3 preproc_pipeline.py --sra_list samples.txt --transcripts transcriptome.fa --decoy decoy.fa --salmon_path /path/to/salmon --fastqc_path /path/to/fastqc --bbduk_path /path/to/bbduk --config config.yaml --outdir output --parallel_jobs 4
 """
 
 import os
@@ -179,7 +179,7 @@ def fastqc_passed_quality(srr):
 			return None, None
 		import re
 		for line in open(file):
-			# Exemplo: <tr><td>Total Sequences</td><td>23400214</td></tr>
+			# Example: <tr><td>Total Sequences</td><td>23400214</td></tr>
 			m_total = re.search(r'<tr><td>Total Sequences</td><td>(\d+)</td></tr>', line)
 			if m_total:
 				total = int(m_total.group(1))
@@ -298,7 +298,7 @@ def fastqc_worker():
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
 					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
-					# Salva erro
+					# Save error
 					error_file = os.path.join(error_dir, f"{srr}_fastqc_error.txt")
 					try:
 						with open(error_file, 'w') as ef:
@@ -330,7 +330,7 @@ def fastqc_worker():
 						bbduk_queue.put([species, srr])  # Move to next stage
 					else:
 						update_stats('failed_processing')
-						# Salva erro
+						# Save error
 						error_file = os.path.join(error_dir, f"{srr}_fastqc_error.txt")
 						try:
 							with open(error_file, 'w') as ef:
@@ -386,7 +386,7 @@ def bbduk_worker():
 				if not (os.path.exists(r1_file) and os.path.exists(r2_file)):
 					logger.error(f"Raw files not found for {srr}")
 					update_stats('failed_processing')
-					# Salva erro
+					# Save error
 					error_file = os.path.join(error_dir, f"{srr}_bbduk_error.txt")
 					try:
 						with open(error_file, 'w') as ef:
@@ -416,7 +416,7 @@ def bbduk_worker():
 						if bbduk_result.returncode != 0:
 							logger.error(f"Error cleaning {srr} ({'R1' if idx==0 else 'R2'}): {bbduk_result.stderr}")
 							update_stats('failed_processing')
-							# Salva erro
+							# Save error
 							error_file = os.path.join(error_dir, f"{srr}_bbduk_error.txt")
 							try:
 								with open(error_file, 'a') as ef:
@@ -463,7 +463,7 @@ def bbduk_worker():
 							else:
 								success_r2 = True
 
-					# Só atualiza stats e adiciona na salmon_queue se ambos foram limpos com sucesso
+					# Only updates stats and adds to salmon_queue if both were cleaned successfully
 					if success_r1 and success_r2:
 						update_stats('cleaned')
 						salmon_queue.put([species, srr])  # Move to next stage
@@ -536,7 +536,7 @@ def salmon_worker():
 					salmon_quant_cmd = [
 						args.salmon_path, "quant", "-i", f"{salmon_index_dir}/{species}", "-l", "A",
 						"-1", clean_r1, "-2", clean_r2,
-						"-p", "4", "--validateMappings", "--seqBias", "--gcBias",
+						"-p", "4", "--validateMappings", "--seqBias", "--gcBias", "--dumpEq", "--numGibbsSamples", "200",
 						"-o", sample_output
 					]
 
@@ -544,7 +544,7 @@ def salmon_worker():
 					if quant_result.returncode != 0:
 						logger.error(f"Error quantifying {srr}: {quant_result.stderr}")
 						update_stats('failed_processing')
-						# Escreve erro em arquivo específico
+						# Write error to specific file
 						error_file = os.path.join(error_dir, f"{srr}_salmon_error.txt")
 						try:
 							with open(error_file, 'w') as ef:
@@ -735,7 +735,7 @@ for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 
 		logger.info(f"Processing sample {i}/{len(sra_ids)}: {srr}")
 
-		# Se já existe FastQC, não baixa, só manda para o BBduk (se passar critério)
+		# If FastQC already exists, skip download and send directly to BBduk (if criteria are met)
 		if check_fastqc_completed(srr):
 			logger.info(f"{srr} FastQC already exists, skipping download and FastQC step")
 			if not check_cleaning_completed(srr):
@@ -750,7 +750,7 @@ for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 					logger.info(f"{srr} added to Salmon queue (BBduk completed)")
 			continue
 
-		# Download sequencialmente (apenas se não existe FastQC)
+		# Download sequentially (only if FastQC does not exist)
 		if download_sample(srr):
 			if not check_fastqc_completed(srr):
 				fastqc_queue.put([species, srr])
