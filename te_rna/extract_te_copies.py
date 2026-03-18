@@ -50,6 +50,17 @@ log = logging.getLogger(__name__)
 # Parsers
 # ---------------------------------------------------------------------------
 
+NON_TE = {
+    "Simple_repeat",
+    "Low_complexity",
+    "rRNA",
+    "tRNA",
+    "Satellite",
+    "snRNA",
+    "scRNA",
+    "srpRNA",
+}
+
 def parse_repeatmasker_out(rm_path: str) -> pd.DataFrame:
 
     """
@@ -79,11 +90,16 @@ def parse_repeatmasker_out(rm_path: str) -> pd.DataFrame:
                 continue
 
             try:
-                contig  = fields[4]
-                start   = int(fields[5]) - 1   # Convert to 0-based
-                end     = int(fields[6])         # End is exclusive in Python slicing
-                strand  = fields[8]              # '+' or 'C'
-                name    = fields[9]
+                contig = fields[4]
+                start = int(fields[5]) - 1   # Convert to 0-based
+                end = int(fields[6])         # End is exclusive in Python slicing
+                strand = fields[8]              # '+' or 'C'
+                name = fields[9]
+                repeat_class = fields[10]
+
+                # Non-TE filter
+                if repeat_class in NON_TE:
+                    continue
 
                 # query_left is stored as "(N)" – strip the parentheses
                 query_left = int(fields[7].strip("()"))
@@ -104,6 +120,7 @@ def parse_repeatmasker_out(rm_path: str) -> pd.DataFrame:
                     "End"              : end,
                     "Strand"           : strand,
                     "TE_name"          : name,
+                    "repeat_class"     : repeat_class,
                     "query_left"       : query_left,
                     "subject_aln_start": subject_aln_start,
                     "subject_aln_end"  : subject_aln_end,
