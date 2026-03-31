@@ -1,4 +1,5 @@
 from collections import Counter
+import os
 
 from Bio import Entrez
 import pandas as pd
@@ -60,10 +61,7 @@ def load_bioprojects(csv_path):
 	"""
 	df = pd.read_csv(csv_path)
 
-	if "bioproject" in df.columns:
-		return df["bioproject"].dropna().astype(str).unique().tolist()
-	else:
-		return df.iloc[:, 0].dropna().astype(str).unique().tolist()
+	return df["bioproject"].dropna().astype(str).unique().tolist()
 
 
 def fetch_sra_runinfo(bioproject):
@@ -101,10 +99,10 @@ def fetch_sra_runinfo(bioproject):
 
 def load_srr_list(csv_path):
 	df = pd.read_csv(csv_path)
-	if "srr" in df.columns:
-		return set(df["srr"].dropna().astype(str))
-	else:
-		return set(df.iloc[:, 0].dropna().astype(str))
+
+	Counter(df["srr"].dropna().astype(str))
+
+	return set(df["srr"].dropna().astype(str)), set([s for s, count in Counter(df["srr"].dropna().astype(str)).items() if count > 1])
 
 
 def analyze_bioprojects(bioproject_list, species):
@@ -125,10 +123,10 @@ def analyze_bioprojects(bioproject_list, species):
 		df_total["ScientificName"].str.contains(species, na=False)
 	]
 
-	return df_total, df_species
+	return df_species
 
 
-def generate_report(df_species, user_srrs, output_prefix, species, bioproject_list):
+def generate_report(df_species, user_srrs, output_prefix, species, duplicates, bioproject_list):
 	srrs_expected = set(df_species["Run"])
 	srrs_user = user_srrs
 
@@ -140,12 +138,16 @@ def generate_report(df_species, user_srrs, output_prefix, species, bioproject_li
 	print(f"In your list: {len(srrs_user)}")
 	print(f"Missing: {len(missing)}")
 	print(f"Extra: {len(extra)}")
+	print(f"Duplicated: {len(duplicates)}")
 
 	# Save filtered metadata
-	df_species.to_csv(f"{output_prefix}_filtered.csv", index=False)
+	os.makedirs(output_prefix, exist_ok=True)
+	df_species[df_species["Run"].isin(duplicates)].to_csv(f"{output_prefix}/{output_prefix}_duplicates.csv", index=False)
+	df_species[df_species["Run"].isin(missing)].to_csv(f"{output_prefix}/{output_prefix}_missing.csv", index=False)
+	df_species[df_species["Run"].isin(extra)].to_csv(f"{output_prefix}/{output_prefix}_extra.csv", index=False)
 
 	# Save text report
-	with open(f"{output_prefix}.txt", "w") as f:
+	with open(f"{output_prefix}/{output_prefix}.txt", "w") as f:
 		f.write("===== SRA REPORT =====\n\n")
 		f.write(f"Species: {species}\n")
 		f.write(f"BioProjects: {', '.join(bioproject_list)}\n\n")
@@ -162,6 +164,8 @@ def generate_report(df_species, user_srrs, output_prefix, species, bioproject_li
 			f.write(s + "\n")
 		
 		f.write("\n=== DUPLICATED SRRs IN YOUR LIST ===\n")
+		for s in sorted(duplicates):
+			f.write(s + "\n")
 
 	print(f"\n[OK] Reports saved with prefix: {output_prefix}")
 
@@ -176,9 +180,9 @@ def main():
 
 	bioproject_list = load_bioprojects(args.bioprojects)
 
-	user_srrs = load_srr_list(args.bioprojects)
+	user_srrs, duplicates = load_srr_list(args.bioprojects)
 	
-	df_total, df_species = analyze_bioprojects(
+	df_species = analyze_bioprojects(
 		bioproject_list,
 		args.species
 	)
@@ -188,6 +192,7 @@ def main():
 		user_srrs,
 		args.output,
 		args.species,
+		duplicates,
 		bioproject_list
 	)
 
