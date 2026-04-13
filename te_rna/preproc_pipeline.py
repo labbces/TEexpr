@@ -24,18 +24,20 @@ import time
 import sys
 import shutil
 import logging
+from contextlib import contextmanager
 
 # Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--sra_list", required=True, help="File with the IDs (SRR)")
-parser.add_argument("--transcripts", required=True, help="Path to transcriptome FASTA file")
+parser.add_argument("--transcripts", required=True, help="Path to transcriptome FASTA file (applied to all species), or TSV file with 'species\\tpath' per line for per-species transcriptomes")
 parser.add_argument("--config", default="config.yaml", help="Path to configuration YAML file")
 parser.add_argument("--outdir", default="pipeline_output", help="Output directory")
 parser.add_argument("--salmon_path", default="salmon", help="Path to Salmon")
 parser.add_argument("--fastqc_path", default="fastqc", help="Path to FastQC")
 parser.add_argument("--bbduk_path", default="bbduk.sh", help="Path to BBduk")
 parser.add_argument("--parallel_jobs", default="5", help="Maximum number of parallel jobs")
-parser.add_argument("--decoy", help="Path to decoy sequences FASTA file (optional)")
+parser.add_argument("--cores", default="4", help="Number of threads per tool (FastQC, BBduk, Salmon)")
+parser.add_argument("--decoy", help="Path to decoy sequences FASTA file (optional, applied to all species), or TSV file with 'species\\tpath' per line for per-species decoys")
 args = parser.parse_args()
 
 if not os.path.exists(args.config):
@@ -132,12 +134,68 @@ with open(args.sra_list) as f:
 		else:
 			sra_ids[parts[0]].append(parts[1])
 
+def _load_tsv_map(filepath):
+	"""Load a TSV file with 'species\\tpath' lines into a dict."""
+	result = {}
+	with open(filepath, 'r') as _f:
+		for _line in _f:
+			_line = _line.strip()
+			if _line and not _line.startswith('#'):
+				_parts = _line.split('\t', 1)
+				if len(_parts) == 2:
+					result[_parts[0]] = _parts[1]
+	return result
+
+def _is_tsv_map(filepath):
+	"""Return True if file looks like a species->path TSV (not a FASTA)."""
+	with open(filepath, 'r') as _f:
+		_first = _f.readline().strip()
+	return '\t' in _first and not _first.startswith('>')
+
+# Build transcripts map: {species: path}
+transcripts_map = {}
+if _is_tsv_map(args.transcripts):
+	multi_species_mode = True
+	transcripts_map = _load_tsv_map(args.transcripts)
+	for _sp in sra_ids:
+		if _sp not in transcripts_map:
+			print(f"No transcript file found for species '{_sp}' in transcripts mapping file")
+			sys.exit(1)
+else:
+	multi_species_mode = False
+	for _sp in sra_ids:
+		transcripts_map[_sp] = args.transcripts
+
+# Build decoys map: {species: path | None}
+decoys_map = {}
+if args.decoy and _is_tsv_map(args.decoy):
+	_decoy_tsv = _load_tsv_map(args.decoy)
+	for _sp in sra_ids:
+		decoys_map[_sp] = _decoy_tsv.get(_sp)  # None if not present
+elif args.decoy:
+	for _sp in sra_ids:
+		decoys_map[_sp] = args.decoy
+else:
+	for _sp in sra_ids:
+		decoys_map[_sp] = None
+
+# Create per-species salmon results directories when in multi-species mode
+species_salmon_results_dir = {}
+if multi_species_mode:
+	for _sp in sra_ids:
+		_sp_dir = os.path.join(outdir, _sp, "salmon_results")
+		os.makedirs(_sp_dir, exist_ok=True)
+		species_salmon_results_dir[_sp] = _sp_dir
+else:
+	for _sp in sra_ids:
+		species_salmon_results_dir[_sp] = salmon_results_dir
+
 # Global variables for tracking progress
 sample_queue = queue.Queue()
 fastqc_queue = queue.Queue()
 bbduk_queue = queue.Queue()
 salmon_queue = queue.Queue()
-salmon_index_built = threading.Event()
+salmon_index_built = {species: threading.Event() for species in sra_ids}
 pipeline_shutdown = threading.Event()
 
 processing_stats = {
@@ -155,6 +213,38 @@ active_fastqc_workers = 0
 active_bbduk_workers = 0
 active_salmon_workers = 0
 worker_lock = threading.Lock()
+
+# Global core pool: limits total threads used across all concurrent tool processes
+class CorePool:
+    """Thread-safe pool that limits total cores used across all running tools."""
+    def __init__(self, total_cores):
+        self._available = total_cores
+        self._total = total_cores
+        self._cond = threading.Condition()
+
+    def acquire(self, n):
+        with self._cond:
+            while self._available < n:
+                self._cond.wait()
+            self._available -= n
+
+    def release(self, n):
+        with self._cond:
+            self._available += n
+            self._cond.notify_all()
+
+    @contextmanager
+    def use(self, n):
+        self.acquire(n)
+        try:
+            yield n
+        finally:
+            self.release(n)
+
+total_cores = int(args.cores)
+parallel_jobs = int(args.parallel_jobs)
+cores_per_job = max(1, total_cores // parallel_jobs)
+core_pool = CorePool(total_cores)
 
 def update_stats(category, increment=1):
 	"""Thread-safe update of processing statistics"""
@@ -201,10 +291,11 @@ def check_cleaning_completed(srr):
 	clean_r2 = os.path.join(clean_dir, f"{srr}_clean_2.fastq.gz")
 	return os.path.exists(clean_r1) and os.path.getsize(clean_r1) > 0 and os.path.exists(clean_r2) and os.path.getsize(clean_r2) > 0
 
-def check_quantification_completed(srr):
+def check_quantification_completed(srr, species):
 	"""Check if Salmon quantification is already completed for a sample"""
-	quant_log = os.path.join(salmon_results_dir, srr, "logs", "salmon_quant.log")
-	quant_file = os.path.join(salmon_results_dir, srr, "quant.sf")
+	sp_results_dir = species_salmon_results_dir[species]
+	quant_log = os.path.join(sp_results_dir, srr, "logs", "salmon_quant.log")
+	quant_file = os.path.join(sp_results_dir, srr, "quant.sf")
 
 	if not os.path.exists(quant_log):
 		return False
@@ -318,8 +409,9 @@ def fastqc_worker():
 					success = True
 					fastqc_errors = ""
 					for fastq_file in [r1_file, r2_file]:
-						fastqc_cmd = [args.fastqc_path, fastq_file, "-o", fastqc_dir, "--threads", "4", "--quiet"]
-						fastqc_result = subprocess.run(fastqc_cmd, capture_output=True, text=True)
+						fastqc_cmd = [args.fastqc_path, fastq_file, "-o", fastqc_dir, "--threads", str(cores_per_job), "--quiet"]
+						with core_pool.use(cores_per_job):
+							fastqc_result = subprocess.run(fastqc_cmd, capture_output=True, text=True)
 						if fastqc_result.returncode != 0:
 							logger.warning(f"FastQC failed for {os.path.basename(fastq_file)}: {fastqc_result.stderr}")
 							success = False
@@ -409,10 +501,11 @@ def bbduk_worker():
 					success_r2 = False
 					for idx, (r_file, clean_r) in enumerate([(r1_file, clean_r1), (r2_file, clean_r2)]):
 						bbduk_cmd = [
-							args.bbduk_path, f"in={r_file}", f"out={clean_r}", "threads=4"
+							args.bbduk_path, f"in={r_file}", f"out={clean_r}", f"threads={cores_per_job}"
 						]
 
-						bbduk_result = subprocess.run(bbduk_cmd, capture_output=True, text=True)
+						with core_pool.use(cores_per_job):
+							bbduk_result = subprocess.run(bbduk_cmd, capture_output=True, text=True)
 						if bbduk_result.returncode != 0:
 							logger.error(f"Error cleaning {srr} ({'R1' if idx==0 else 'R2'}): {bbduk_result.stderr}")
 							update_stats('failed_processing')
@@ -494,7 +587,7 @@ def salmon_worker():
 			with worker_lock:
 				active_salmon_workers += 1
 				
-			if check_quantification_completed(srr):
+			if check_quantification_completed(srr, species):
 				logger.info(f"Salmon quantification already completed for {srr}, skipping")
 				update_stats('quantified')
 				# Remove raw data
@@ -508,8 +601,8 @@ def salmon_worker():
 					except Exception as e:
 						logger.warning(f"Could not remove raw file {f} after Salmon: {e}")
 			else:
-				# Wait for index to be built
-				salmon_index_built.wait()
+				# Wait for index to be built for this species
+				salmon_index_built[species].wait()
 
 				logger.info(f"Starting Salmon quantification for {srr}")
 
@@ -531,16 +624,17 @@ def salmon_worker():
 						except Exception as e:
 							logger.warning(f"Could not remove raw file {f} after Salmon error: {e}")
 				else:
-					sample_output = os.path.join(salmon_results_dir, srr)
+					sample_output = os.path.join(species_salmon_results_dir[species], srr)
 
 					salmon_quant_cmd = [
 						args.salmon_path, "quant", "-i", f"{salmon_index_dir}/{species}", "-l", "A",
 						"-1", clean_r1, "-2", clean_r2,
-						"-p", "4", "--validateMappings", "--seqBias", "--gcBias", "--dumpEq", "--numGibbsSamples", "200",
+						"-p", str(cores_per_job), "--validateMappings", "--seqBias", "--gcBias", "--dumpEq", "--numGibbsSamples", "200",
 						"-o", sample_output
 					]
 
-					quant_result = subprocess.run(salmon_quant_cmd, capture_output=True, text=True)
+					with core_pool.use(cores_per_job):
+						quant_result = subprocess.run(salmon_quant_cmd, capture_output=True, text=True)
 					if quant_result.returncode != 0:
 						logger.error(f"Error quantifying {srr}: {quant_result.stderr}")
 						update_stats('failed_processing')
@@ -613,67 +707,68 @@ def get_available_slots():
 		total_active = active_fastqc_workers + active_bbduk_workers + active_salmon_workers
 		return max(0, int(args.parallel_jobs) - total_active)
 
-def build_salmon_index(species):
+def build_salmon_index(species, transcript_path):
 	"""Build Salmon index in a separate thread"""
 	logger = logging.getLogger(__name__)
-	
+
 	# Check if index already exists
 	index_info_file = os.path.join(salmon_index_dir, species, "info.json")
 	if os.path.exists(index_info_file):
-		logger.info("Salmon index already exists, skipping build")
-		salmon_index_built.set()  # Signal that index is ready
+		logger.info(f"Salmon index for '{species}' already exists, skipping build")
+		salmon_index_built[species].set()  # Signal that index is ready
 		return
-	
+
 	logger.info(f"Building Salmon index for species: {species}")
-	
-	if not os.path.exists(args.transcripts):
-		logger.error(f"Transcriptome file not found: {args.transcripts}")
+
+	if not os.path.exists(transcript_path):
+		logger.error(f"Transcriptome file not found for species '{species}': {transcript_path}")
 		sys.exit(1)
-	
+
 	# Build index command
-	salmon_index_cmd = [args.salmon_path, "index", "-t", args.transcripts, "-i", f"{salmon_index_dir}/{species}"]
-	
-	# Add decoy if provided
-	if args.decoy:
-		if not os.path.exists(args.decoy):
-			logger.error(f"Decoy file not found: {args.decoy}")
+	salmon_index_cmd = [args.salmon_path, "index", "-t", transcript_path, "-i", f"{salmon_index_dir}/{species}"]
+
+	# Add decoy if provided for this species
+	decoy_path = decoys_map.get(species)
+	if decoy_path:
+		if not os.path.exists(decoy_path):
+			logger.error(f"Decoy file not found for species '{species}': {decoy_path}")
 			sys.exit(1)
-		
+
 		# Create combined transcriptome + decoy file
 		combined_file = os.path.join(salmon_index_dir, f"{species}_combined.fa")
 		logger.info(f"Creating combined transcriptome + decoy file: {combined_file}")
-		
+
 		with open(combined_file, 'w') as out_f:
 			# Copy transcriptome
-			with open(args.transcripts, 'r') as trans_f:
+			with open(transcript_path, 'r') as trans_f:
 				out_f.write(trans_f.read())
 			# Copy decoy
-			with open(args.decoy, 'r') as decoy_f:
+			with open(decoy_path, 'r') as decoy_f:
 				out_f.write(decoy_f.read())
-		
+
 		# Create decoy names file
 		decoy_names_file = os.path.join(salmon_index_dir, f"{species}_decoys.txt")
 		with open(decoy_names_file, 'w') as decoy_f:
-			with open(args.decoy, 'r') as input_f:
+			with open(decoy_path, 'r') as input_f:
 				for line in input_f:
 					if line.startswith('>'):
 						decoy_name = line[1:].split()[0]  # Remove '>' and get first part
 						decoy_f.write(f"{decoy_name}\n")
-		
+
 		# Update command to use combined file and decoy names
 		salmon_index_cmd = [
 			args.salmon_path, "index", "-t", combined_file, "-i", f"{salmon_index_dir}/{species}",
 			"-d", decoy_names_file
 		]
-		logger.info(f"Using decoy sequences from: {args.decoy}")
-	
+		logger.info(f"Using decoy sequences from: {decoy_path}")
+
 	index_result = subprocess.run(salmon_index_cmd, capture_output=True, text=True)
 	if index_result.returncode != 0:
-		logger.error(f"Error building Salmon index: {index_result.stderr}")
+		logger.error(f"Error building Salmon index for '{species}': {index_result.stderr}")
 		sys.exit(1)
-	
-	logger.info("Salmon index successfully created")
-	salmon_index_built.set()  # Signal that index is ready
+
+	logger.info(f"Salmon index for '{species}' successfully created")
+	salmon_index_built[species].set()  # Signal that index is ready
 
 # Main pipeline execution
 logger.info("=" * 80)
@@ -685,16 +780,20 @@ logger.info(f"Base URL: {args.base_url}")
 logger.info("Pipeline structure:")
 logger.info("  Download: Sequential (one sample at a time)")
 logger.info("  Processing: Parallel per sample (FastQC → BBduk → Salmon)")
-logger.info("  Threads per tool: FastQC=4, BBduk=4, Salmon=4")
+logger.info("  Core pool: {total_cores} total cores, {cores_per_job} cores/job ({parallel_jobs} parallel jobs)")
 logger.info(f"  Total concurrent samples: Up to {args.parallel_jobs}")
 
 # Check for existing results and show resume information
 logger.info("CHECKING EXISTING RESULTS")
 
-# Start building Salmon index in background
-index_thread = threading.Thread(target=build_salmon_index, args=(list(sra_ids.keys())[0],))
-index_thread.daemon = True
-index_thread.start()
+# Start building Salmon index for each species in background
+logger.info(f"Starting Salmon index building for {len(transcripts_map)} species")
+index_threads = []
+for _species, _transcript_path in transcripts_map.items():
+	_t = threading.Thread(target=build_salmon_index, args=(_species, _transcript_path))
+	_t.daemon = True
+	_t.start()
+	index_threads.append(_t)
 
 # Start workers for parallel processing
 logger.info("Starting worker threads")
@@ -729,7 +828,7 @@ logger.info("Starting sequential download and ordered parallel processing")
 for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 	for srr in srr_list:
 		# Skip if already fully processed
-		if check_quantification_completed(srr):
+		if check_quantification_completed(srr, species):
 			logger.info(f"{srr} already fully processed, skipping")
 			continue
 
@@ -744,7 +843,7 @@ for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 					logger.info(f"{srr} added to BBduk queue (FastQC passed quality)")
 				else:
 					logger.warning(f"{srr} did not pass FastQC quality threshold (>80% good sequences), skipping BBduk and Salmon")
-			elif not check_quantification_completed(srr):
+			elif not check_quantification_completed(srr, species):
 				if check_cleaning_completed(srr):
 					salmon_queue.put([species, srr])
 					logger.info(f"{srr} added to Salmon queue (BBduk completed)")
@@ -761,7 +860,7 @@ for i, (species, srr_list) in enumerate(sra_ids.items(), 1):
 					logger.info(f"{srr} added to BBduk queue (FastQC passed quality)")
 				else:
 					logger.warning(f"{srr} did not pass FastQC quality threshold (>80% good sequences), skipping BBduk and Salmon")
-			elif not check_quantification_completed(srr):
+			elif not check_quantification_completed(srr, species):
 				if check_cleaning_completed(srr):
 					salmon_queue.put([species, srr])
 					logger.info(f"{srr} added to Salmon queue (BBduk completed)")
@@ -807,50 +906,59 @@ for _ in range(int(args.parallel_jobs)):
 for worker in workers:
 	worker.join(timeout=10)
 
-# Wait for index building to complete
-index_thread.join()
+# Wait for all index building threads to complete
+for _t in index_threads:
+	_t.join()
 
 logger.info("MERGING QUANTIFICATION RESULTS")
 
-# Merge quantification results
+# Merge quantification results per species
 if processing_stats['quantified'] > 0:
 	logger.info("Merging quantification results")
-	
-	# Find all directories with quant.sf files
-	quant_dirs = []
-	for item in os.listdir(salmon_results_dir):
-		quant_file = os.path.join(salmon_results_dir, item, "quant.sf")
-		if os.path.isfile(quant_file):
-			quant_dirs.append(os.path.join(salmon_results_dir, item))
-	
-	if quant_dirs:
+
+	for _sp, _sp_results_dir in species_salmon_results_dir.items():
+		_merge_outdir = os.path.join(outdir, _sp) if multi_species_mode else outdir
+
+		# Find all directories with quant.sf files for this species
+		quant_dirs = []
+		if os.path.isdir(_sp_results_dir):
+			for item in os.listdir(_sp_results_dir):
+				quant_file = os.path.join(_sp_results_dir, item, "quant.sf")
+				if os.path.isfile(quant_file):
+					quant_dirs.append(os.path.join(_sp_results_dir, item))
+
+		if not quant_dirs:
+			continue
+
+		_sp_label = f" [{_sp}]" if multi_species_mode else ""
+
 		# Merge TPM values
 		tpm_merge_cmd = [
 			args.salmon_path, "quantmerge",
 			"--column", "TPM",
-			"--output", os.path.join(outdir, "merged_TPM.tsv"),
+			"--output", os.path.join(_merge_outdir, "merged_TPM.tsv"),
 			"--quants"
 		] + quant_dirs
-		
+
 		tpm_result = subprocess.run(tpm_merge_cmd, capture_output=True, text=True)
 		if tpm_result.returncode != 0:
-			logger.error(f"Error merging TPM: {tpm_result.stderr}")
+			logger.error(f"Error merging TPM{_sp_label}: {tpm_result.stderr}")
 		else:
-			logger.info("TPM merge completed successfully")
-		
+			logger.info(f"TPM merge completed successfully{_sp_label}")
+
 		# Merge count values
 		counts_merge_cmd = [
 			args.salmon_path, "quantmerge",
 			"--column", "NumReads",
-			"--output", os.path.join(outdir, "merged_counts.tsv"),
+			"--output", os.path.join(_merge_outdir, "merged_counts.tsv"),
 			"--quants"
 		] + quant_dirs
-		
+
 		counts_result = subprocess.run(counts_merge_cmd, capture_output=True, text=True)
 		if counts_result.returncode != 0:
-			logger.error(f"Error merging counts: {counts_result.stderr}")
+			logger.error(f"Error merging counts{_sp_label}: {counts_result.stderr}")
 		else:
-			logger.info("Counts merge completed successfully")
+			logger.info(f"Counts merge completed successfully{_sp_label}")
 
 logger.info("FINAL CLEANUP")
 
@@ -884,11 +992,20 @@ logger.info(f"  Failed processing: {processing_stats['failed_processing']}")
 logger.info(f"Results directory: {outdir}")
 if processing_stats['downloaded'] > 0:
 	logger.info(f"  - FastQC results: {fastqc_dir}")
-	logger.info(f"  - Salmon quantification results: {salmon_results_dir}")
-	if os.path.exists(os.path.join(outdir, "merged_TPM.tsv")):
-		logger.info(f"  - Merged TPM results: {os.path.join(outdir, 'merged_TPM.tsv')}")
-	if os.path.exists(os.path.join(outdir, "merged_counts.tsv")):
-		logger.info(f"  - Merged counts results: {os.path.join(outdir, 'merged_counts.tsv')}")
+	if multi_species_mode:
+		for _sp, _sp_dir in species_salmon_results_dir.items():
+			logger.info(f"  - Salmon results [{_sp}]: {_sp_dir}")
+			_sp_outdir = os.path.join(outdir, _sp)
+			if os.path.exists(os.path.join(_sp_outdir, "merged_TPM.tsv")):
+				logger.info(f"  - Merged TPM [{_sp}]: {os.path.join(_sp_outdir, 'merged_TPM.tsv')}")
+			if os.path.exists(os.path.join(_sp_outdir, "merged_counts.tsv")):
+				logger.info(f"  - Merged counts [{_sp}]: {os.path.join(_sp_outdir, 'merged_counts.tsv')}")
+	else:
+		logger.info(f"  - Salmon quantification results: {salmon_results_dir}")
+		if os.path.exists(os.path.join(outdir, "merged_TPM.tsv")):
+			logger.info(f"  - Merged TPM results: {os.path.join(outdir, 'merged_TPM.tsv')}")
+		if os.path.exists(os.path.join(outdir, "merged_counts.tsv")):
+			logger.info(f"  - Merged counts results: {os.path.join(outdir, 'merged_counts.tsv')}")
 
 # Exit with appropriate code
 total_failures = processing_stats['failed_downloads'] + processing_stats['failed_processing']
