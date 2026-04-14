@@ -129,10 +129,14 @@ sra_ids = {}
 with open(args.sra_list) as f:
 	for line in f:
 		parts = line.strip().split()
-		if parts[0] not in sra_ids:
-			sra_ids[parts[0]] = [parts[1]]
+		if len(parts) < 2:
+			continue
+		species = parts[0]
+		srr = parts[-1]  # last column is always the SRR ID (handles 2 or 3+ column formats)
+		if species not in sra_ids:
+			sra_ids[species] = [srr]
 		else:
-			sra_ids[parts[0]].append(parts[1])
+			sra_ids[species].append(srr)
 
 def _load_tsv_map(filepath):
 	"""Load a TSV file with 'species\\tpath' lines into a dict."""
