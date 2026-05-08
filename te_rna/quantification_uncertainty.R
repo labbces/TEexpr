@@ -1,12 +1,10 @@
 # ==============================================================================
 # TE quantification uncertainty analysis using Salmon Gibbs replicates.
-# VERSION: single-sample mode (for testing)
 #
-# The infReps structure
-# is correctly handled for both single and multi-sample runs.
+# Compatible with single and multiple samples.
 #
 # Usage (terminal):
-# Rscript quantification_uncertainty_single_sample.R <conditions.tsv> [salmon_dir] [out_dir]
+# Rscript quantification_uncertainty_final.R
 # ==============================================================================
 
 
@@ -19,7 +17,7 @@ if (!requireNamespace("BiocManager", quietly = TRUE)) {
 }
 
 cran_packages <- c("ggplot2", "dplyr", "tidyr", "matrixStats",
-                   "pheatmap", "viridis")
+                   "pheatmap", "viridis", "gridExtra", "gtable", "grid")
 
 for (pkg in cran_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -44,18 +42,26 @@ library(tidyr)
 library(matrixStats)
 library(pheatmap)
 library(viridis)
+library(gridExtra)
+library(gtable)
+library(grid)
 
 
 # ==============================================================================
 # STEP 2: Set paths
 # ==============================================================================
 
-CONDITIONS_FILE <- "~/rnaseq_d.tsv"
-SALMON_DIR      <- "~/salmon_results"
-OUT_DIR         <- "~/test_results"
+CONDITIONS_FILE     <- "~/rnaseq_d.tsv"
+SALMON_DIR          <- "~/salmon_results"
+OUT_DIR             <- "~/uncertainty_results"
+CLASSIFICATION_FILE <- "~/Sviridis.flTE.mapids"
 
 if (!file.exists(CONDITIONS_FILE)) {
   stop("Conditions file not found: ", CONDITIONS_FILE)
+}
+
+if (!file.exists(CLASSIFICATION_FILE)) {
+  stop("Classification file not found: ", CLASSIFICATION_FILE)
 }
 
 
@@ -70,13 +76,11 @@ conditions <- read.table(
   stringsAsFactors = FALSE
 )
 
-# --- Diagnostic: show what was loaded ---
-cat("Conditions file loaded successfully!\n")
+cat("Conditions file loaded!\n")
 cat("Number of samples:", nrow(conditions), "\n")
 cat("Columns found:", paste(colnames(conditions), collapse = ", "), "\n")
 cat("Groups found:", paste(unique(conditions$condition), collapse = ", "), "\n\n")
 
-# Single-sample mode warning
 if (nrow(conditions) == 1) {
   cat("*** SINGLE-SAMPLE MODE: some multi-sample plots will be skipped. ***\n\n")
 }
@@ -97,10 +101,7 @@ if (any(missing_files)) {
        paste(conditions$files[missing_files], collapse = "\n"))
 }
 
-cat("All quant.sf files found!\n")
-cat("Files to be imported:\n")
-print(conditions$files)
-cat("\n")
+cat("All quant.sf files found!\n\n")
 
 files <- setNames(conditions$files, conditions$sample)
 
@@ -118,22 +119,18 @@ txi <- tximport(
   dropInfReps = FALSE
 )
 
-# --- Diagnostic: check dimensions before building SE ---
-cat("\n--- Dimension check ---\n")
-cat("counts:   ", dim(txi$counts), "\n")
+cat("\n--- Dimension check after import ---\n")
+cat("counts:   ", dim(txi$counts),    "\n")
 cat("abundance:", dim(txi$abundance), "\n")
-cat("length:   ", dim(txi$length), "\n")
-cat("infReps is a list of", length(txi$infReps), "element(s)\n")
-cat("Each infRep element dimensions:", dim(txi$infReps[[1]]), "\n")
-cat("  (expected: n_TEs x n_GibbsSamples)\n\n")
+cat("length:   ", dim(txi$length),    "\n")
+cat("infReps: list of", length(txi$infReps), "element(s)\n")
+cat("Each infRep element:", dim(txi$infReps[[1]]), "(TEs x Gibbs replicates)\n\n")
 
-n_te_raw  <- nrow(txi$counts)
-n_samples <- ncol(txi$counts)
-n_gibbs   <- ncol(txi$infReps[[1]])   # number of Gibbs replicates (e.g. 200)
+n_gibbs <- ncol(txi$infReps[[1]])
 
-cat("TEs imported:          ", n_te_raw, "\n")
-cat("Samples detected:      ", n_samples, "\n")
-cat("Gibbs replicates/TE:   ", n_gibbs, "\n\n")
+cat("TEs imported:         ", nrow(txi$counts), "\n")
+cat("Samples detected:     ", ncol(txi$counts), "\n")
+cat("Gibbs replicates/TE:  ", n_gibbs, "\n\n")
 
 if (n_gibbs == 0) {
   stop("No Gibbs replicates found. Make sure Salmon was run with --numGibbsSamples.")
@@ -143,19 +140,16 @@ if (n_gibbs == 0) {
 # ==============================================================================
 # STEP 6: Build a SummarizedExperiment object
 # ==============================================================================
-# tximport returns txi$infReps as a LIST with one element per SAMPLE.
-# Each element is a matrix of n_TEs x n_GibbsSamples.
-#
-# SummarizedExperiment needs each assay to be n_TEs x n_SAMPLES.
-# So we restructure: for Gibbs replicate k, collect column k from
-# every sample and cbind them into one n_TEs x n_SAMPLES matrix.
+# tximport returns txi$infReps as a list indexed by sample.
+# Each element is a matrix n_TEs x n_Gibbs.
+# SE needs each assay as n_TEs x n_samples.
+# We restructure: for replicate k, collect column k from every sample.
 # ==============================================================================
 
 cat("Restructuring infReps for SummarizedExperiment...\n")
 
 inf_assays <- setNames(
   lapply(seq_len(n_gibbs), function(k) {
-    # For replicate k: extract column k from each sample's matrix and bind
     mat <- do.call(cbind, lapply(txi$infReps, function(sample_mat) {
       sample_mat[, k, drop = FALSE]
     }))
@@ -165,11 +159,9 @@ inf_assays <- setNames(
   paste0("infRep", seq_len(n_gibbs))
 )
 
-# Verify the restructuring worked
-cat("infRep1 dimensions after restructuring:", dim(inf_assays[[1]]), "\n")
-cat("(expected:", n_te_raw, "x", n_samples, ")\n\n")
+cat("infRep1 after restructuring:", dim(inf_assays[[1]]),
+    "(expected:", nrow(txi$counts), "x", ncol(txi$counts), ")\n\n")
 
-# Build the SummarizedExperiment
 se <- SummarizedExperiment(
   assays  = c(
     list(counts    = txi$counts,
@@ -183,47 +175,115 @@ se <- SummarizedExperiment(
   )
 )
 
-# Scale inferential replicates (adjusts for sequencing depth)
-# scaleInfReps normalizes across samples; skip when only one sample is present
-if (n_samples > 1) {
+# Scale inferential replicates (requires at least 2 samples)
+if (ncol(se) > 1) {
   se <- scaleInfReps(se)
 } else {
-  cat("scaleInfReps skipped: normalization across samples requires at least 2 samples.\n\n")
+  cat("scaleInfReps skipped: requires at least 2 samples.\n\n")
 }
 
 samples   <- colnames(se)
 n_samples <- length(samples)
-te_names  <- rownames(se)
-n_te      <- nrow(se)
 
-cat("SummarizedExperiment built successfully!\n")
+cat("SummarizedExperiment built!\n")
+cat("Dimensions:", nrow(se), "IDs x", n_samples, "samples\n\n")
+
+
+# ==============================================================================
+# STEP 7: Assign TE classification from external file
+# ==============================================================================
+# TE IDs follow: TE_<numericID>_copy<N>|Chr_XX:start-end|strand
+# Genes are IDs NOT starting with "TE_".
+# TEdistill "[specie].mapids" file: no header, tab-separated, 3 columns:
+#   col 1: TE_<numericID>
+#   col 2: ClassificationA/a  <- used here
+#   col 3: TE_<numericID>#ClassificationA/a
+# ==============================================================================
+
+te_class_ref <- read.table(
+  CLASSIFICATION_FILE,
+  header           = FALSE,
+  sep              = "\t",
+  stringsAsFactors = FALSE,
+  col.names        = c("te_id", "classification", "te_id_full")
+)
+
+cat("Classification file loaded:", nrow(te_class_ref), "entries\n\n")
+
+all_ids  <- rownames(se)
+is_te    <- grepl("^TE_", all_ids)
+te_ids   <- all_ids[is_te]
+gene_ids <- all_ids[!is_te]
+
+cat("Total IDs:  ", length(all_ids),  "\n")
+cat("TEs found:  ", length(te_ids),   "\n")
+cat("Genes found:", length(gene_ids), "\n\n")
+
+# Extract TE_<numericID> by removing everything from "_copy" onward
+te_base_id <- sub("_copy.*", "", te_ids)
+
+# Verify extraction
+cat("Extraction check:\n")
+cat("  Input  :", head(te_ids, 2),      "\n")
+cat("  Extracted:", head(te_base_id, 2), "\n\n")
+
+# Check coverage
+n_matched   <- sum(te_base_id %in% te_class_ref$te_id)
+n_unmatched <- sum(!te_base_id %in% te_class_ref$te_id)
+cat("Matched:  ", n_matched,   "\n")
+cat("Unmatched:", n_unmatched, "\n\n")
+
+# Map classification using lookup
+class_lookup     <- setNames(te_class_ref$classification, te_class_ref$te_id)
+te_classification <- class_lookup[te_base_id]
+
+# Fill unmatched
+te_classification[is.na(te_classification)] <- "Unknown"
+
+# Split into family and superfamily
+te_family      <- sub("/.*", "", te_classification)
+te_superfamily <- ifelse(
+  grepl("/", te_classification),
+  sub(".*/", "", te_classification),
+  te_family
+)
+
+# Standardize ambiguous labels
+te_classification[te_classification == "unknown"] <- "Unknown"
+te_family[te_family                 == "unknown"] <- "Unknown"
+te_superfamily[te_superfamily       == "unknown"] <- "Unknown"
+
+cat("Unique classifications:", length(unique(te_classification)), "\n")
+cat("Unique families:       ", length(unique(te_family)),         "\n")
+cat("Unique superfamilies:  ", length(unique(te_superfamily)),    "\n\n")
+
+
+# ==============================================================================
+# STEP 7b: Filter SE to retain only TE rows
+# ==============================================================================
+
+se       <- se[is_te, ]
+te_names <- rownames(se)
+n_te     <- nrow(se)
+
+cat("SE filtered to TEs only.\n")
 cat("Dimensions:", n_te, "TEs x", n_samples, "samples\n\n")
 
+# Alignment check
+cat("Alignment check:\n")
+cat("  length(te_family):     ", length(te_family),     "\n")
+cat("  length(te_superfamily):", length(te_superfamily), "\n")
+cat("  nrow(se):              ", nrow(se),              "\n\n")
 
-# ==============================================================================
-# STEP 7: Extract TE family and superfamily names
-# ==============================================================================
-# TE names from RepeatMasker: CopyName#Family/Superfamily
-# Example: "AluSx1#SINE/Alu"
-# ==============================================================================
-
-te_family <- sub(".*#", "", te_names)
-te_family <- sub("/.*", "", te_family)
-te_family[!grepl("#", te_names)] <- "unknown"
-
-te_superfamily <- rep("unknown", length(te_names))
-has_hash  <- grepl("#", te_names)
-has_slash <- grepl("/", te_names)
-te_superfamily[has_hash & has_slash] <- sub(".*#.*?/", "", te_names[has_hash & has_slash])
-
-cat("Unique families found:     ", length(unique(te_family)), "\n")
-cat("Unique superfamilies found:", length(unique(te_superfamily)), "\n\n")
+if (length(te_family) != nrow(se) || length(te_superfamily) != nrow(se)) {
+  stop("Alignment error: te_family or te_superfamily length does not match nrow(se).")
+}
 
 
 # ==============================================================================
 # STEP 8: Calculate uncertainty metrics
 # ==============================================================================
-# For each TE in each sample we summarize variance across Gibbs replicates.
+# For each TE in each sample, summarize variance across 200 Gibbs replicates.
 #
 # CV   = SD / mean        (relative spread; main metric)
 # SD   = standard deviation
@@ -245,7 +305,6 @@ for (s in seq_len(n_samples)) {
   
   cat("  Processing sample", s, "of", n_samples, ":", samples[s], "\n")
   
-  # Extract all Gibbs replicates for this sample -> matrix n_TEs x n_gibbs
   rep_matrix <- sapply(rep_names, function(r) assay(se, r)[, s])
   
   mean_vals <- rowMeans(rep_matrix, na.rm = TRUE)
@@ -263,6 +322,27 @@ cat("\nMetrics calculated!\n\n")
 
 
 # ==============================================================================
+# STEP 8b: Sanitize rownames of all metric matrices
+# ------------------------------------------------------------------------------
+# The | character in TE IDs breaks R matrix and data.frame operations.
+# Truncate all rownames here once so all downstream steps work cleanly.
+# te_names is also updated to stay consistent.
+# ==============================================================================
+
+clean_names <- sub("\\|.*", "", rownames(mat_cv))
+
+rownames(mat_cv)   <- clean_names
+rownames(mat_sd)   <- clean_names
+rownames(mat_iqr)  <- clean_names
+rownames(mat_fano) <- clean_names
+
+te_names <- clean_names
+
+cat("Rownames sanitized.\n")
+cat("Example:", head(te_names, 2), "\n\n")
+
+
+# ==============================================================================
 # STEP 9: Summarize metrics across samples
 # ==============================================================================
 
@@ -272,18 +352,67 @@ mean_iqr  <- rowMeans(mat_iqr,  na.rm = TRUE)
 mean_fano <- rowMeans(mat_fano, na.rm = TRUE)
 mean_tpm  <- rowMeans(assay(se, "abundance"), na.rm = TRUE)
 
-copy_metrics <- data.frame(
-  te_copy     = te_names,
-  family      = te_family,
-  superfamily = te_superfamily,
-  mean_tpm    = mean_tpm,
-  mean_cv     = mean_cv,
-  mean_sd     = mean_sd,
-  mean_iqr    = mean_iqr,
-  mean_fano   = mean_fano,
+# Strip names to prevent | from breaking data.frame construction
+names(mean_cv)   <- NULL
+names(mean_sd)   <- NULL
+names(mean_iqr)  <- NULL
+names(mean_fano) <- NULL
+names(mean_tpm)  <- NULL
+
+# Build mapping from clean TE ID to base ID for classification join
+id_map <- as.data.frame(
+  list(
+    te_copy    = te_names,
+    te_base_id = sub("_copy.*", "", te_names)
+  ),
   stringsAsFactors = FALSE
 )
+rownames(id_map) <- NULL
 
+# Join with classification reference
+id_map <- merge(
+  id_map,
+  te_class_ref[, c("te_id", "classification")],
+  by.x  = "te_base_id",
+  by.y  = "te_id",
+  all.x = TRUE
+)
+
+id_map$classification[is.na(id_map$classification)] <- "Unknown"
+
+id_map$family      <- sub("/.*", "", id_map$classification)
+id_map$superfamily <- ifelse(
+  grepl("/", id_map$classification),
+  sub(".*/", "", id_map$classification),
+  id_map$family
+)
+
+id_map$family[id_map$family           == "unknown"] <- "Unknown"
+id_map$superfamily[id_map$superfamily == "unknown"] <- "Unknown"
+
+# Build copy_metrics via list to avoid | parsing issues
+copy_metrics <- as.data.frame(
+  list(
+    te_copy   = te_names,
+    mean_tpm  = mean_tpm,
+    mean_cv   = mean_cv,
+    mean_sd   = mean_sd,
+    mean_iqr  = mean_iqr,
+    mean_fano = mean_fano
+  ),
+  stringsAsFactors = FALSE
+)
+rownames(copy_metrics) <- NULL
+
+# Merge classification
+copy_metrics <- merge(
+  copy_metrics,
+  id_map[, c("te_copy", "family", "superfamily", "classification")],
+  by    = "te_copy",
+  all.x = TRUE
+)
+
+# Sort by CV descending and add rank
 copy_metrics <- copy_metrics[order(copy_metrics$mean_cv,
                                    decreasing = TRUE,
                                    na.last    = TRUE), ]
@@ -296,6 +425,32 @@ write.table(copy_metrics,
 cat("Table saved: uncertainty_by_copy.tsv\n")
 cat("Most uncertain TE:", copy_metrics$te_copy[1],
     "(CV =", round(copy_metrics$mean_cv[1], 3), ")\n\n")
+
+
+# ==============================================================================
+# STEP 9b: Hybrid uncertainty metric
+# ------------------------------------------------------------------------------
+# CV is unstable when mean TPM is near zero.
+# Below TPM_THRESHOLD we use Fano index instead.
+# ==============================================================================
+
+TPM_THRESHOLD <- 0.5
+
+copy_metrics$metric_used <- ifelse(
+  copy_metrics$mean_tpm >= TPM_THRESHOLD, "CV", "Fano"
+)
+
+copy_metrics$hybrid_uncertainty <- ifelse(
+  copy_metrics$metric_used == "CV",
+  copy_metrics$mean_cv,
+  copy_metrics$mean_fano
+)
+
+n_cv_regime   <- sum(copy_metrics$metric_used == "CV",   na.rm = TRUE)
+n_fano_regime <- sum(copy_metrics$metric_used == "Fano", na.rm = TRUE)
+
+cat("TEs using CV   (mean TPM >=", TPM_THRESHOLD, "):", n_cv_regime,   "\n")
+cat("TEs using Fano (mean TPM < ", TPM_THRESHOLD, "):", n_fano_regime, "\n\n")
 
 
 # ==============================================================================
@@ -334,53 +489,103 @@ THEME_BASE <- theme_bw(base_size = 12) +
 cat("Generating plots...\n")
 
 
-# Plot 1: CV distribution (density) -------------------------------------------
+# Plot 1: Hybrid uncertainty distribution (two panels) ------------------------
 
-p1 <- ggplot(copy_metrics, aes(x = mean_cv)) +
+p1a <- ggplot(
+  filter(copy_metrics, metric_used == "CV"),
+  aes(x = mean_cv)
+) +
   geom_density(fill = "steelblue", alpha = 0.5) +
   geom_vline(
-    xintercept = median(copy_metrics$mean_cv, na.rm = TRUE),
-    linetype   = "dashed", colour = "firebrick", linewidth = 0.9
-  ) +
-  annotate(
-    "text",
-    x      = median(copy_metrics$mean_cv, na.rm = TRUE) * 1.05,
-    y      = Inf, vjust = 2, hjust = 0, size = 3.5,
-    label  = paste0("Median = ", round(median(copy_metrics$mean_cv, na.rm = TRUE), 3)),
-    colour = "firebrick"
+    xintercept = median(copy_metrics$mean_cv[copy_metrics$metric_used == "CV"],
+                        na.rm = TRUE),
+    linetype = "dashed", colour = "firebrick", linewidth = 0.9
   ) +
   labs(
-    title    = "Plot 1: Global CV distribution",
-    subtitle = paste0(n_te, " TE copies — ", n_samples, " sample(s)"),
-    x        = "Mean CV  (SD / mean of Gibbs replicates)",
-    y        = "Density"
+    title    = "1A: CV distribution (expressed TEs)",
+    subtitle = paste0("mean TPM >= ", TPM_THRESHOLD, " — n = ", n_cv_regime, " TEs"),
+    x = "Mean CV",
+    y = "Density"
   ) +
   THEME_BASE
 
-ggsave(file.path(OUT_DIR, "plots", "01_cv_distribution.pdf"),
-       p1, width = 8, height = 5)
-cat("  -> 01_cv_distribution.pdf saved\n")
+p1b <- ggplot(
+  filter(copy_metrics, metric_used == "Fano"),
+  aes(x = mean_fano)
+) +
+  geom_density(fill = "darkorange", alpha = 0.5) +
+  geom_vline(
+    xintercept = median(copy_metrics$mean_fano[copy_metrics$metric_used == "Fano"],
+                        na.rm = TRUE),
+    linetype = "dashed", colour = "firebrick", linewidth = 0.9
+  ) +
+  labs(
+    title    = "1B: Fano distribution (lowly expressed TEs)",
+    subtitle = paste0("mean TPM < ", TPM_THRESHOLD, " — n = ", n_fano_regime, " TEs"),
+    x = "Mean Fano index",
+    y = "Density"
+  ) +
+  THEME_BASE
+
+pdf(file.path(OUT_DIR, "plots", "01_uncertainty_distribution.pdf"),
+    width = 8, height = 9)
+gridExtra::grid.arrange(p1a, p1b, ncol = 1)
+dev.off()
+cat("  -> 01_uncertainty_distribution.pdf saved\n")
 
 
-# Plot 2: Expression level vs CV ----------------------------------------------
+# Plot 2: Expression level vs hybrid uncertainty ------------------------------
 
-p2 <- ggplot(copy_metrics,
-             aes(x = log10(mean_tpm + 0.01), y = mean_cv, colour = superfamily)) +
-  geom_point(size = 0.8, alpha = 0.4) +
+top_sf <- names(sort(table(copy_metrics$superfamily), decreasing = TRUE))[1:8]
+
+copy_metrics$superfamily_plot <- ifelse(
+  copy_metrics$superfamily %in% top_sf,
+  copy_metrics$superfamily,
+  "Other"
+)
+
+sf_order <- c(sort(top_sf), "Other")
+copy_metrics$superfamily_plot <- factor(copy_metrics$superfamily_plot,
+                                        levels = sf_order)
+
+sf_colors <- c(
+  "#E69F00", "#56B4E9", "#009E73", "#F0E442",
+  "#0072B2", "#D55E00", "#CC79A7", "#999999", "#444444"
+)
+names(sf_colors) <- sf_order
+
+p2 <- ggplot(
+  copy_metrics,
+  aes(x = log10(mean_tpm + 0.01), y = hybrid_uncertainty,
+      colour = superfamily_plot)
+) +
+  geom_point(size = 0.8, alpha = 0.35) +
   geom_smooth(method = "loess", colour = "black", se = TRUE, linewidth = 0.8) +
+  geom_vline(
+    xintercept = log10(TPM_THRESHOLD + 0.01),
+    linetype = "dashed", colour = "grey30", linewidth = 0.8
+  ) +
+  annotate(
+    "text",
+    x = log10(TPM_THRESHOLD + 0.01) + 0.05,
+    y = Inf, vjust = 2, hjust = 0, size = 3.2, colour = "grey30",
+    label = paste0("Threshold = ", TPM_THRESHOLD, " TPM")
+  ) +
+  scale_colour_manual(values = sf_colors) +
+  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1), ncol = 1)) +
   labs(
     title    = "Plot 2: Expression level vs Uncertainty",
-    subtitle = "Each dot = one TE copy; black line = LOESS trend",
+    subtitle = "Top 8 superfamilies shown; remaining collapsed into 'Other'",
     x        = "log10(mean TPM + 0.01)",
-    y        = "Mean CV",
+    y        = "Hybrid uncertainty metric",
     colour   = "Superfamily"
   ) +
   THEME_BASE +
-  theme(legend.text = element_text(size = 7))
+  theme(legend.text = element_text(size = 9))
 
-ggsave(file.path(OUT_DIR, "plots", "02_abundance_vs_cv.pdf"),
-       p2, width = 9, height = 6)
-cat("  -> 02_abundance_vs_cv.pdf saved\n")
+ggsave(file.path(OUT_DIR, "plots", "02_abundance_vs_uncertainty.pdf"),
+       p2, width = 10, height = 6)
+cat("  -> 02_abundance_vs_uncertainty.pdf saved\n")
 
 
 # Plot 3: Boxplot — CV by family (top 25) -------------------------------------
@@ -410,40 +615,94 @@ ggsave(file.path(OUT_DIR, "plots", "03_cv_by_family_boxplot.pdf"),
 cat("  -> 03_cv_by_family_boxplot.pdf saved\n")
 
 
-# Plot 4: Heatmap — CV per sample, top 40 TEs ---------------------------------
+# Plot 4: Heatmap — CV per sample (top 40 per sample) -------------------------
 
-top40_te     <- head(copy_metrics$te_copy, 40)
-mat_cv_top40 <- mat_cv[top40_te, , drop = FALSE]
+# ==============================================================================
+# CUSTOMIZE APPEARANCE HERE
+# ==============================================================================
 
-# Remove rows with any NA to allow hclust to run
-mat_cv_top40 <- mat_cv_top40[complete.cases(mat_cv_top40), , drop = FALSE]
-
-# If too few rows remain, disable row clustering to avoid hclust error
-cluster_rows_flag <- nrow(mat_cv_top40) > 1
-
-annotation_columns <- data.frame(
-  Condition = as.character(colData(se)$condition),
-  row.names = colnames(se)
+condition_colors <- list(
+  " " = c(
+    "control" = "#56B4E9",
+    "drought" = "#E69F00"
+  )
 )
 
-pdf(file.path(OUT_DIR, "plots", "04_heatmap_cv_top40_TEs.pdf"),
-    width = max(8, n_samples * 0.7 + 3), height = 10)
+title_fontsize     <- 13        # font size in points
+title_fontface     <- "bold"    # "plain", "bold", "italic", "bold.italic"
+title_margin_lines <- 2         # blank lines between title and heatmap body
+cell_border_color  <- "white"   # "NA" = no border
 
-pheatmap(
-  mat_cv_top40,
-  color          = viridis(100),
-  cluster_rows   = cluster_rows_flag,
-  cluster_cols   = (n_samples > 1),
-  annotation_col = annotation_columns,
-  show_rownames  = TRUE,
-  show_colnames  = TRUE,
-  fontsize_row   = 7,
-  main           = "CV per sample — Top 40 most uncertain TEs",
-  na_col         = "grey80"
-)
+# ==============================================================================
 
-dev.off()
-cat("  -> 04_heatmap_cv_top40_TEs.pdf saved\n")
+for (s in samples) {
+  
+  cv_sample <- mat_cv[, s]
+  valid_te  <- names(cv_sample)[!is.na(cv_sample) & !is.nan(cv_sample) &
+                                  !is.infinite(cv_sample)]
+  
+  cat("Sample", s, "— TEs with valid CV:", length(valid_te), "\n")
+  
+  if (length(valid_te) < 2) {
+    cat("  -> Heatmap skipped for", s, ": fewer than 2 valid TEs.\n")
+    next
+  }
+  
+  top_n    <- min(40, length(valid_te))
+  top40_te <- names(sort(cv_sample[valid_te], decreasing = TRUE))[1:top_n]
+  
+  mat_sub <- mat_cv[top40_te, , drop = FALSE]
+  
+  # Impute remaining NAs with row mean
+  mat_sub <- t(apply(mat_sub, 1, function(row) {
+    row[is.na(row)] <- mean(row, na.rm = TRUE)
+    row
+  }))
+  
+  # Title with spacing
+  title_padding <- paste(rep("\n", title_margin_lines), collapse = "")
+  plot_title    <- paste0("CV — Top ", top_n,
+                          " most uncertain TEs in ", s, title_padding)
+  
+  annotation_columns <- data.frame(
+    " "         = as.character(colData(se)$condition),
+    row.names   = colnames(se),
+    check.names = FALSE
+  )
+  
+  outfile <- file.path(OUT_DIR, "plots",
+                       paste0("04_heatmap_cv_top40_", s, ".pdf"))
+  
+  saved <- tryCatch({
+    pdf(outfile, width = max(8, n_samples * 0.7 + 3), height = 10)
+    pheatmap(
+      mat_sub,
+      color             = viridis(100),
+      cluster_rows      = FALSE,
+      cluster_cols      = FALSE,
+      annotation_col    = annotation_columns,
+      annotation_colors = condition_colors,
+      show_rownames     = TRUE,
+      show_colnames     = TRUE,
+      fontsize_row      = 7,
+      border_color      = cell_border_color,
+      main              = plot_title,
+      na_col            = "grey80",
+      fontsize          = 10,
+      main_fontface     = title_fontface,
+      main_fontsize     = title_fontsize,
+      silent            = FALSE
+    )
+    dev.off()
+    cat("  ->", basename(outfile), "saved\n")
+    TRUE
+  }, error = function(e) {
+    if (dev.cur() > 1) dev.off()
+    cat("  ERROR for", s, ":", conditionMessage(e), "\n")
+    FALSE
+  })
+}
+
 
 # Plot 5: Violin — CV per sample (skipped if only one sample) -----------------
 
@@ -478,7 +737,7 @@ if (n_samples > 1) {
   cat("  -> 05_cv_violin_per_sample.pdf saved\n\n")
   
 } else {
-  cat("  -> Plot 5 (violin per sample) skipped: only one sample available.\n\n")
+  cat("  -> Plot 5 skipped: only one sample available.\n\n")
 }
 
 
@@ -486,25 +745,35 @@ if (n_samples > 1) {
 # STEP 12: Final summary
 # ==============================================================================
 
+n_complete_te <- sum(complete.cases(mat_cv))
+
 cat("=======================================================================\n")
 cat("ANALYSIS COMPLETE\n")
 cat("=======================================================================\n")
-cat("TEs analysed:        ", n_te, "\n")
-cat("Samples:             ", n_samples, "\n")
-cat("Gibbs replicates:    ", n_gibbs, "\n")
-cat("Families found:      ", length(unique(te_family)), "\n")
-cat("\nGlobal mean CV:      ", round(mean(copy_metrics$mean_cv, na.rm = TRUE), 4), "\n")
-cat("Global median CV:    ", round(median(copy_metrics$mean_cv, na.rm = TRUE), 4), "\n")
-cat("Most uncertain TE:   ", copy_metrics$te_copy[1],
+cat("TEs analysed:              ", n_te,        "\n")
+cat("Samples:                   ", n_samples,   "\n")
+cat("Gibbs replicates:          ", n_gibbs,     "\n")
+cat("Families found:            ", length(unique(copy_metrics$family)), "\n")
+cat("TEs with complete CV data: ", n_complete_te,
+    "(", round(n_complete_te / n_te * 100, 1), "% of total)\n")
+cat("TEs using CV metric:       ", n_cv_regime,   "\n")
+cat("TEs using Fano metric:     ", n_fano_regime, "\n")
+cat("\nGlobal mean CV:            ",
+    round(mean(copy_metrics$mean_cv, na.rm = TRUE), 4), "\n")
+cat("Global median CV:          ",
+    round(median(copy_metrics$mean_cv, na.rm = TRUE), 4), "\n")
+cat("Most uncertain TE:         ", copy_metrics$te_copy[1],
     "(CV =", round(copy_metrics$mean_cv[1], 4), ")\n")
 cat("\nOutput files saved in:", OUT_DIR, "\n")
 cat("  tables/\n")
 cat("    uncertainty_by_copy.tsv\n")
 cat("    uncertainty_by_family.tsv\n")
 cat("  plots/\n")
-cat("    01_cv_distribution.pdf\n")
-cat("    02_abundance_vs_cv.pdf\n")
+cat("    01_uncertainty_distribution.pdf\n")
+cat("    02_abundance_vs_uncertainty.pdf\n")
 cat("    03_cv_by_family_boxplot.pdf\n")
-cat("    04_heatmap_cv_top40_TEs.pdf\n")
+cat("    04_heatmap_cv_top40_<sample>.pdf  (one per sample)\n")
 if (n_samples > 1) cat("    05_cv_violin_per_sample.pdf\n")
 cat("=======================================================================\n")
+
+sessionInfo()
