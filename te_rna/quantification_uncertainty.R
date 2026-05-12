@@ -3,21 +3,18 @@
 #
 # Compatible with single and multiple samples.
 #
-# Usage (terminal):
-# Rscript quantification_uncertainty_final.R
 # ==============================================================================
 
 
-# ==============================================================================
-# STEP 1: Install and load packages
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Install and load packages
+# ------------------------------------------------------------------------------
 
 if (!requireNamespace("BiocManager", quietly = TRUE)) {
   install.packages("BiocManager")
 }
 
-cran_packages <- c("ggplot2", "dplyr", "tidyr", "matrixStats",
-                   "pheatmap", "viridis", "gridExtra", "gtable", "grid")
+cran_packages <- c("ggplot2", "dplyr", "tidyr", "matrixStats", "viridis")
 
 for (pkg in cran_packages) {
   if (!requireNamespace(pkg, quietly = TRUE)) {
@@ -40,21 +37,20 @@ library(ggplot2)
 library(dplyr)
 library(tidyr)
 library(matrixStats)
-library(pheatmap)
 library(viridis)
-library(gridExtra)
-library(gtable)
-library(grid)
 
 
-# ==============================================================================
-# STEP 2: Set paths
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Set paths
+# ------------------------------------------------------------------------------
 
 CONDITIONS_FILE     <- "~/rnaseq_d.tsv"
 SALMON_DIR          <- "~/salmon_results"
-OUT_DIR             <- "~/uncertainty_results"
+OUT_DIR             <- "~/test_results_newplots"
 CLASSIFICATION_FILE <- "~/Sviridis.flTE.mapids"
+
+# Number of top uncertain TEs to show in expression profile plot
+N_TOP_TE_PROFILES <- 12
 
 if (!file.exists(CONDITIONS_FILE)) {
   stop("Conditions file not found: ", CONDITIONS_FILE)
@@ -65,9 +61,9 @@ if (!file.exists(CLASSIFICATION_FILE)) {
 }
 
 
-# ==============================================================================
-# STEP 3: Read the conditions file
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Read the conditions file
+# ------------------------------------------------------------------------------
 
 conditions <- read.table(
   CONDITIONS_FILE,
@@ -78,20 +74,14 @@ conditions <- read.table(
 
 cat("Conditions file loaded!\n")
 cat("Number of samples:", nrow(conditions), "\n")
-cat("Columns found:", paste(colnames(conditions), collapse = ", "), "\n")
 cat("Groups found:", paste(unique(conditions$condition), collapse = ", "), "\n\n")
-
-if (nrow(conditions) == 1) {
-  cat("*** SINGLE-SAMPLE MODE: some multi-sample plots will be skipped. ***\n\n")
-}
-
 dir.create(file.path(OUT_DIR, "tables"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(OUT_DIR, "plots"),  recursive = TRUE, showWarnings = FALSE)
 
 
-# ==============================================================================
-# STEP 4: Locate Salmon output files
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Locate Salmon output files
+# ------------------------------------------------------------------------------
 
 conditions$files <- file.path(SALMON_DIR, conditions$sample, "quant.sf")
 
@@ -106,9 +96,9 @@ cat("All quant.sf files found!\n\n")
 files <- setNames(conditions$files, conditions$sample)
 
 
-# ==============================================================================
-# STEP 5: Import Salmon data with tximport
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Import Salmon data with tximport
+# ------------------------------------------------------------------------------
 
 cat("Importing Salmon data (this may take a few minutes)...\n")
 
@@ -118,13 +108,6 @@ txi <- tximport(
   txOut       = TRUE,
   dropInfReps = FALSE
 )
-
-cat("\n--- Dimension check after import ---\n")
-cat("counts:   ", dim(txi$counts),    "\n")
-cat("abundance:", dim(txi$abundance), "\n")
-cat("length:   ", dim(txi$length),    "\n")
-cat("infReps: list of", length(txi$infReps), "element(s)\n")
-cat("Each infRep element:", dim(txi$infReps[[1]]), "(TEs x Gibbs replicates)\n\n")
 
 n_gibbs <- ncol(txi$infReps[[1]])
 
@@ -137,14 +120,20 @@ if (n_gibbs == 0) {
 }
 
 
-# ==============================================================================
-# STEP 6: Build a SummarizedExperiment object
-# ==============================================================================
-# tximport returns txi$infReps as a list indexed by sample.
-# Each element is a matrix n_TEs x n_Gibbs.
-# SE needs each assay as n_TEs x n_samples.
-# We restructure: for replicate k, collect column k from every sample.
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Build a SummarizedExperiment object
+# ------------------------------------------------------------------------------
+# tximport returns txi$infReps as a list of 200 matrices, each with dimensions
+# n_TEs x n_samples. Then they are assigned sequential names and stored as
+# individual assays alongside counts, abundance, and length.
+#
+# The resulting object (se) centralizes all data with guaranteed row/column
+# alignment across assays:
+#   assay(se, "counts")    -> read counts       [n_TEs x n_samples]
+#   assay(se, "abundance") -> TPM values        [n_TEs x n_samples]
+#   assay(se, "infRep1")   -> Gibbs replicate 1 [n_TEs x n_samples]
+#   assay(se, "infRep200") -> Gibbs replicate 200 [n_TEs x n_samples]
+#   colData(se)$condition  -> condition label per sample
 
 cat("Restructuring infReps for SummarizedExperiment...\n")
 
@@ -175,30 +164,26 @@ se <- SummarizedExperiment(
   )
 )
 
-# Scale inferential replicates (requires at least 2 samples)
-if (ncol(se) > 1) {
-  se <- scaleInfReps(se)
-} else {
-  cat("scaleInfReps skipped: requires at least 2 samples.\n\n")
-}
-
+# Scale inferential replicates (The amount of reads in each of the
+# conditions is different. It's required to scale this or do a correction for
+# the sequencing effort).
+se <- scaleInfReps(se)
 samples   <- colnames(se)
 n_samples <- length(samples)
+# se now contains scaled inferential replicates
 
 cat("SummarizedExperiment built!\n")
-cat("Dimensions:", nrow(se), "IDs x", n_samples, "samples\n\n")
 
 
-# ==============================================================================
-# STEP 7: Assign TE classification from external file
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Assign TE classification from external file
+# ------------------------------------------------------------------------------
 # TE IDs follow: TE_<numericID>_copy<N>|Chr_XX:start-end|strand
 # Genes are IDs NOT starting with "TE_".
 # TEdistill "[specie].mapids" file: no header, tab-separated, 3 columns:
 #   col 1: TE_<numericID>
 #   col 2: ClassificationA/a  <- used here
 #   col 3: TE_<numericID>#ClassificationA/a
-# ==============================================================================
 
 te_class_ref <- read.table(
   CLASSIFICATION_FILE,
@@ -222,11 +207,6 @@ cat("Genes found:", length(gene_ids), "\n\n")
 # Extract TE_<numericID> by removing everything from "_copy" onward
 te_base_id <- sub("_copy.*", "", te_ids)
 
-# Verify extraction
-cat("Extraction check:\n")
-cat("  Input  :", head(te_ids, 2),      "\n")
-cat("  Extracted:", head(te_base_id, 2), "\n\n")
-
 # Check coverage
 n_matched   <- sum(te_base_id %in% te_class_ref$te_id)
 n_unmatched <- sum(!te_base_id %in% te_class_ref$te_id)
@@ -234,7 +214,7 @@ cat("Matched:  ", n_matched,   "\n")
 cat("Unmatched:", n_unmatched, "\n\n")
 
 # Map classification using lookup
-class_lookup     <- setNames(te_class_ref$classification, te_class_ref$te_id)
+class_lookup      <- setNames(te_class_ref$classification, te_class_ref$te_id)
 te_classification <- class_lookup[te_base_id]
 
 # Fill unmatched
@@ -253,14 +233,37 @@ te_classification[te_classification == "unknown"] <- "Unknown"
 te_family[te_family                 == "unknown"] <- "Unknown"
 te_superfamily[te_superfamily       == "unknown"] <- "Unknown"
 
-cat("Unique classifications:", length(unique(te_classification)), "\n")
-cat("Unique families:       ", length(unique(te_family)),         "\n")
-cat("Unique superfamilies:  ", length(unique(te_superfamily)),    "\n\n")
+
+# ------------------------------------------------------------------------------
+# Compute gene CV before filtering SE (needed for Plot 01)
+# ------------------------------------------------------------------------------
+# Plot 01 compares CV distributions of TEs vs protein-coding genes.
+# Gene rows are only accessible before se is filtered to TEs, so we compute
+# their global mean CV here and store it as global_cv_gene.
+
+cat("Computing CV for protein-coding genes (for Plot 01)...\n")
+
+rep_names <- paste0("infRep", seq_len(n_gibbs))
+gene_idx  <- which(!is_te)
+n_gene    <- length(gene_idx)
+
+mat_cv_gene <- matrix(NA, nrow = n_gene, ncol = n_samples,
+                      dimnames = list(gene_ids, samples))
+
+for (s in seq_len(n_samples)) {
+  rep_mat_g        <- sapply(rep_names, function(r) assay(se, r)[gene_idx, s]) + 1
+  mean_g           <- rowMeans(rep_mat_g, na.rm = TRUE)
+  sd_g             <- matrixStats::rowSds(rep_mat_g, na.rm = TRUE)
+  mat_cv_gene[, s] <- sd_g / mean_g
+}
+
+global_cv_gene <- rowMeans(mat_cv_gene, na.rm = TRUE)
+cat("  Done:", n_gene, "genes processed\n\n")
 
 
-# ==============================================================================
-# STEP 7b: Filter SE to retain only TE rows
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Filter SE to retain only TE rows
+# ------------------------------------------------------------------------------
 
 se       <- se[is_te, ]
 te_names <- rownames(se)
@@ -269,95 +272,144 @@ n_te     <- nrow(se)
 cat("SE filtered to TEs only.\n")
 cat("Dimensions:", n_te, "TEs x", n_samples, "samples\n\n")
 
-# Alignment check
-cat("Alignment check:\n")
-cat("  length(te_family):     ", length(te_family),     "\n")
-cat("  length(te_superfamily):", length(te_superfamily), "\n")
-cat("  nrow(se):              ", nrow(se),              "\n\n")
-
 if (length(te_family) != nrow(se) || length(te_superfamily) != nrow(se)) {
   stop("Alignment error: te_family or te_superfamily length does not match nrow(se).")
 }
 
 
-# ==============================================================================
-# STEP 8: Calculate uncertainty metrics
-# ==============================================================================
-# For each TE in each sample, summarize variance across 200 Gibbs replicates.
+# ------------------------------------------------------------------------------
+# Calculate uncertainty metrics
+# ------------------------------------------------------------------------------
+# For each TE copy in each sample, we summarize how much the
+# 200 Gibbs replicates vary. High variation = high uncertainty.
 #
-# CV   = SD / mean        (relative spread; main metric)
-# SD   = standard deviation
-# IQR  = Q75 - Q25        (robust to outliers)
-# Fano = variance / mean  (suited for count data)
-# ==============================================================================
+# Four metrics:
+#
+# CV (Coefficient of Variation) = SD / mean
+#   -> relative measure; good for comparing TEs with different
+#      expression levels. A CV of 0.5 means the SD is 50% of
+#      the mean.
+#
+# SD (Standard Deviation)
+#   -> absolute spread of the replicates around the mean.
+#
+# IQR (Interquartile Range) = Q75 - Q25
+#   -> spread of the middle 50% of replicates; robust to
+#      extreme values.
+#
+# phi (quasi-Poisson overdispersion) = variance / mean
+#   -> estimates variance inflation induced by read-to-transcript
+#      mapping ambiguity. Equivalent to the moment estimator proposed
+#      by Chen et al. (Nucleic Acids Research, 2024) and Smyth et al.
+#      (NAR Genomics and Bioinformatics, 2024). rowVars() applies
+#      Bessel's correction (divides by B-1).
+#
+# PSEUDO-COUNT NOTE:
+# We add 1 to all replicate values before computing metrics.
+# This prevents division by zero in CV (SD / mean) and phi
+# (variance / mean) when a TE has zero counts in a sample.
+# Adding 1 is a standard practice in genomics (pseudo-count)
+# and has negligible effect on TEs with typical expression
+# levels, where values are much larger than 1.
 
 cat("Calculating uncertainty metrics...\n")
-
-rep_names <- paste0("infRep", seq_len(n_gibbs))
 
 mat_cv   <- matrix(NA, nrow = n_te, ncol = n_samples,
                    dimnames = list(te_names, samples))
 mat_sd   <- mat_cv
 mat_iqr  <- mat_cv
-mat_fano <- mat_cv
+mat_phi  <- mat_cv
+mat_mean <- mat_cv   # mean of Gibbs replicates; used for expression profiles
 
 for (s in seq_len(n_samples)) {
   
   cat("  Processing sample", s, "of", n_samples, ":", samples[s], "\n")
   
-  rep_matrix <- sapply(rep_names, function(r) assay(se, r)[, s])
+  rep_matrix <- sapply(rep_names, function(r) assay(se, r)[, s]) + 1
   
   mean_vals <- rowMeans(rep_matrix, na.rm = TRUE)
   var_vals  <- matrixStats::rowVars(rep_matrix, na.rm = TRUE)
   sd_vals   <- matrixStats::rowSds(rep_matrix, na.rm = TRUE)
   iqr_vals  <- matrixStats::rowIQRs(rep_matrix, na.rm = TRUE)
   
-  mat_cv[, s]   <- ifelse(mean_vals > 0, sd_vals / mean_vals, NA)
+  mat_mean[, s] <- mean_vals
+  mat_cv[, s]   <- sd_vals / mean_vals
   mat_sd[, s]   <- sd_vals
   mat_iqr[, s]  <- iqr_vals
-  mat_fano[, s] <- ifelse(mean_vals > 0, var_vals / mean_vals, NA)
+  mat_phi[, s]  <- var_vals / mean_vals
 }
 
 cat("\nMetrics calculated!\n\n")
 
 
-# ==============================================================================
-# STEP 8b: Sanitize rownames of all metric matrices
 # ------------------------------------------------------------------------------
-# The | character in TE IDs breaks R matrix and data.frame operations.
-# Truncate all rownames here once so all downstream steps work cleanly.
-# te_names is also updated to stay consistent.
-# ==============================================================================
+# Clean TE ID names in all metric matrices
+# ------------------------------------------------------------------------------
+# Some TE IDs contain the "|" character (e.g. "TE_001|extra"),
+# which can break matrix and data frame operations. So we remove everything
+# from "|" onward, keeping only the first part of the ID.
+# If your IDs do not contain "|", this step has no effect.
 
 clean_names <- sub("\\|.*", "", rownames(mat_cv))
 
 rownames(mat_cv)   <- clean_names
 rownames(mat_sd)   <- clean_names
 rownames(mat_iqr)  <- clean_names
-rownames(mat_fano) <- clean_names
+rownames(mat_phi)  <- clean_names
+rownames(mat_mean) <- clean_names
 
 te_names <- clean_names
 
-cat("Rownames sanitized.\n")
+cat("Rownames cleaned.\n")
 cat("Example:", head(te_names, 2), "\n\n")
 
+# Global mean CV per TE across all samples (used for Plot 01 and ranking)
+global_cv_te <- rowMeans(mat_cv, na.rm = TRUE)
 
-# ==============================================================================
-# STEP 9: Summarize metrics across samples
-# ==============================================================================
 
-mean_cv   <- rowMeans(mat_cv,   na.rm = TRUE)
-mean_sd   <- rowMeans(mat_sd,   na.rm = TRUE)
-mean_iqr  <- rowMeans(mat_iqr,  na.rm = TRUE)
-mean_fano <- rowMeans(mat_fano, na.rm = TRUE)
-mean_tpm  <- rowMeans(assay(se, "abundance"), na.rm = TRUE)
+# ------------------------------------------------------------------------------
+# Summarize metrics across samples - grouped by condition
+# ------------------------------------------------------------------------------
 
-# Strip names to prevent | from breaking data.frame construction
-names(mean_cv)   <- NULL
-names(mean_sd)   <- NULL
-names(mean_iqr)  <- NULL
-names(mean_fano) <- NULL
-names(mean_tpm)  <- NULL
+conditions_vector <- as.character(colData(se)$condition)
+condition_levels  <- c("control", "drought", "rewatering")
+
+# Helper function: given a metric matrix and a condition label,
+# return the row means across samples belonging to that condition
+summarise_by_condition <- function(mat, cond) {
+  cols <- which(conditions_vector == cond)
+  if (length(cols) == 1) return(mat[, cols])
+  rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+}
+
+# Compute per-condition means for each metric
+cv_by_cond  <- lapply(condition_levels, function(c) summarise_by_condition(mat_cv,  c))
+sd_by_cond  <- lapply(condition_levels, function(c) summarise_by_condition(mat_sd,  c))
+iqr_by_cond <- lapply(condition_levels, function(c) summarise_by_condition(mat_iqr, c))
+phi_by_cond <- lapply(condition_levels, function(c) summarise_by_condition(mat_phi, c))
+
+# Compute per-condition mean TPM from the abundance assay
+tpm_mat     <- assay(se, "abundance")
+tpm_by_cond <- lapply(condition_levels, function(c) {
+  cols <- which(conditions_vector == c)
+  if (length(cols) == 1) return(tpm_mat[, cols])
+  rowMeans(tpm_mat[, cols, drop = FALSE], na.rm = TRUE)
+})
+
+# Name each list element by condition for clarity
+names(cv_by_cond)  <- condition_levels
+names(sd_by_cond)  <- condition_levels
+names(iqr_by_cond) <- condition_levels
+names(phi_by_cond) <- condition_levels
+names(tpm_by_cond) <- condition_levels
+
+# Strip vector names to prevent | from breaking data.frame construction
+strip_names <- function(lst) lapply(lst, function(x) { names(x) <- NULL; x })
+cv_by_cond  <- strip_names(cv_by_cond)
+sd_by_cond  <- strip_names(sd_by_cond)
+iqr_by_cond <- strip_names(iqr_by_cond)
+phi_by_cond <- strip_names(phi_by_cond)
+tpm_by_cond <- strip_names(tpm_by_cond)
 
 # Build mapping from clean TE ID to base ID for classification join
 id_map <- as.data.frame(
@@ -380,29 +432,56 @@ id_map <- merge(
 
 id_map$classification[is.na(id_map$classification)] <- "Unknown"
 
-id_map$family      <- sub("/.*", "", id_map$classification)
+id_map$family <- sub("/.*", "", id_map$classification)
 id_map$superfamily <- ifelse(
   grepl("/", id_map$classification),
   sub(".*/", "", id_map$classification),
   id_map$family
 )
 
-id_map$family[id_map$family           == "unknown"] <- "Unknown"
+id_map$family[id_map$family == "unknown"] <- "Unknown"
 id_map$superfamily[id_map$superfamily == "unknown"] <- "Unknown"
 
-# Build copy_metrics via list to avoid | parsing issues
+# Build copy_metrics with one row per TE copy and one column set per condition
 copy_metrics <- as.data.frame(
   list(
-    te_copy   = te_names,
-    mean_tpm  = mean_tpm,
-    mean_cv   = mean_cv,
-    mean_sd   = mean_sd,
-    mean_iqr  = mean_iqr,
-    mean_fano = mean_fano
+    te_copy             = te_names,
+    # TPM per condition
+    mean_tpm_control    = tpm_by_cond[["control"]],
+    mean_tpm_drought    = tpm_by_cond[["drought"]],
+    mean_tpm_rewatering = tpm_by_cond[["rewatering"]],
+    # CV per condition (main uncertainty metric)
+    mean_cv_control     = cv_by_cond[["control"]],
+    mean_cv_drought     = cv_by_cond[["drought"]],
+    mean_cv_rewatering  = cv_by_cond[["rewatering"]],
+    # SD per condition
+    mean_sd_control     = sd_by_cond[["control"]],
+    mean_sd_drought     = sd_by_cond[["drought"]],
+    mean_sd_rewatering  = sd_by_cond[["rewatering"]],
+    # IQR per condition
+    mean_iqr_control    = iqr_by_cond[["control"]],
+    mean_iqr_drought    = iqr_by_cond[["drought"]],
+    mean_iqr_rewatering = iqr_by_cond[["rewatering"]],
+    # quasi-Poisson phi per condition (Chen et al. NAR 2024; Smyth et al. 2024)
+    mean_phi_control    = phi_by_cond[["control"]],
+    mean_phi_drought    = phi_by_cond[["drought"]],
+    mean_phi_rewatering = phi_by_cond[["rewatering"]]
   ),
   stringsAsFactors = FALSE
 )
 rownames(copy_metrics) <- NULL
+
+# Global mean CV across all conditions for ranking purposes
+copy_metrics$mean_cv_global <- rowMeans(
+  copy_metrics[, c("mean_cv_control", "mean_cv_drought", "mean_cv_rewatering")],
+  na.rm = TRUE
+)
+
+# Global mean phi across all conditions
+copy_metrics$mean_phi_global <- rowMeans(
+  copy_metrics[, c("mean_phi_control", "mean_phi_drought", "mean_phi_rewatering")],
+  na.rm = TRUE
+)
 
 # Merge classification
 copy_metrics <- merge(
@@ -412,8 +491,8 @@ copy_metrics <- merge(
   all.x = TRUE
 )
 
-# Sort by CV descending and add rank
-copy_metrics <- copy_metrics[order(copy_metrics$mean_cv,
+# Sort by global CV descending and add rank
+copy_metrics <- copy_metrics[order(copy_metrics$mean_cv_global,
                                    decreasing = TRUE,
                                    na.last    = TRUE), ]
 copy_metrics$rank <- seq_len(nrow(copy_metrics))
@@ -424,48 +503,21 @@ write.table(copy_metrics,
 
 cat("Table saved: uncertainty_by_copy.tsv\n")
 cat("Most uncertain TE:", copy_metrics$te_copy[1],
-    "(CV =", round(copy_metrics$mean_cv[1], 3), ")\n\n")
+    "(global CV =", round(copy_metrics$mean_cv_global[1], 3), ")\n\n")
 
 
-# ==============================================================================
-# STEP 9b: Hybrid uncertainty metric
 # ------------------------------------------------------------------------------
-# CV is unstable when mean TPM is near zero.
-# Below TPM_THRESHOLD we use Fano index instead.
-# ==============================================================================
-
-TPM_THRESHOLD <- 0.5
-
-copy_metrics$metric_used <- ifelse(
-  copy_metrics$mean_tpm >= TPM_THRESHOLD, "CV", "Fano"
-)
-
-copy_metrics$hybrid_uncertainty <- ifelse(
-  copy_metrics$metric_used == "CV",
-  copy_metrics$mean_cv,
-  copy_metrics$mean_fano
-)
-
-n_cv_regime   <- sum(copy_metrics$metric_used == "CV",   na.rm = TRUE)
-n_fano_regime <- sum(copy_metrics$metric_used == "Fano", na.rm = TRUE)
-
-cat("TEs using CV   (mean TPM >=", TPM_THRESHOLD, "):", n_cv_regime,   "\n")
-cat("TEs using Fano (mean TPM < ", TPM_THRESHOLD, "):", n_fano_regime, "\n\n")
-
-
-# ==============================================================================
-# STEP 10: Aggregate metrics by TE family
-# ==============================================================================
+# Aggregate metrics by TE family
+# ------------------------------------------------------------------------------
 
 family_metrics <- copy_metrics %>%
   group_by(family, superfamily) %>%
   summarise(
-    n_copies   = n(),
-    median_tpm = median(mean_tpm, na.rm = TRUE),
-    mean_cv    = mean(mean_cv,    na.rm = TRUE),
-    median_cv  = median(mean_cv,  na.rm = TRUE),
-    mean_fano  = mean(mean_fano,  na.rm = TRUE),
-    .groups    = "drop"
+    n_copies  = n(),
+    mean_cv   = mean(mean_cv_global,  na.rm = TRUE),
+    median_cv = median(mean_cv_global, na.rm = TRUE),
+    mean_phi  = mean(mean_phi_global, na.rm = TRUE),
+    .groups   = "drop"
   ) %>%
   arrange(desc(mean_cv))
 
@@ -476,9 +528,9 @@ write.table(family_metrics,
 cat("Table saved: uncertainty_by_family.tsv\n\n")
 
 
-# ==============================================================================
-# STEP 11: Plots
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Plots
+# ------------------------------------------------------------------------------
 
 THEME_BASE <- theme_bw(base_size = 12) +
   theme(
@@ -486,294 +538,232 @@ THEME_BASE <- theme_bw(base_size = 12) +
     strip.background = element_rect(fill = "grey92")
   )
 
+condition_colors <- c(
+  control    = "#56B4E9",
+  drought    = "#E69F00",
+  rewatering = "#009E73"
+)
+
 cat("Generating plots...\n")
 
 
-# Plot 1: Hybrid uncertainty distribution (two panels) ------------------------
+# Plot 1: CV histogram — TEs vs protein-coding genes ---------------------------
+# Educational comparison showing that TEs have systematically higher
+# quantification uncertainty than genes, due to multi-mapping.
+# X = global mean CV (averaged across all samples).
+# Both curves are shown on the same axis for direct visual comparison.
 
-p1a <- ggplot(
-  filter(copy_metrics, metric_used == "CV"),
-  aes(x = mean_cv)
-) +
-  geom_density(fill = "steelblue", alpha = 0.5) +
-  geom_vline(
-    xintercept = median(copy_metrics$mean_cv[copy_metrics$metric_used == "CV"],
-                        na.rm = TRUE),
-    linetype = "dashed", colour = "firebrick", linewidth = 0.9
-  ) +
+global_cv_df <- data.frame(
+  cv           = c(global_cv_te, global_cv_gene),
+  feature_type = c(rep("Transposable Element", length(global_cv_te)),
+                   rep("Protein-coding gene",  length(global_cv_gene)))
+) %>% filter(!is.na(cv))
+
+med_df <- global_cv_df %>%
+  group_by(feature_type) %>%
+  summarise(med = median(cv, na.rm = TRUE), .groups = "drop")
+
+p01 <- ggplot(global_cv_df,
+              aes(x = cv, fill = feature_type, colour = feature_type)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 80, alpha = 0.45, position = "identity") +
+  geom_density(alpha = 0, linewidth = 0.8) +
+  geom_vline(data = med_df,
+             aes(xintercept = med, colour = feature_type),
+             linetype = "dashed", linewidth = 0.9) +
+  scale_fill_manual(values   = c("Transposable Element" = "#D55E00",
+                                 "Protein-coding gene"  = "#0072B2")) +
+  scale_colour_manual(values = c("Transposable Element" = "#D55E00",
+                                 "Protein-coding gene"  = "#0072B2")) +
   labs(
-    title    = "1A: CV distribution (expressed TEs)",
-    subtitle = paste0("mean TPM >= ", TPM_THRESHOLD, " — n = ", n_cv_regime, " TEs"),
-    x = "Mean CV",
-    y = "Density"
+    title    = "Plot 01: Quantification uncertainty — TEs vs Protein-coding Genes",
+    subtitle = paste0("Mean CV across all ", n_samples, " samples; ",
+                      n_te, " TEs and ", n_gene, " genes; ",
+                      "dashed lines = medians"),
+    x        = "Mean CV  (SD / mean of Gibbs replicates)",
+    y        = "Density",
+    fill     = "Feature type",
+    colour   = "Feature type"
   ) +
   THEME_BASE
 
-p1b <- ggplot(
-  filter(copy_metrics, metric_used == "Fano"),
-  aes(x = mean_fano)
-) +
-  geom_density(fill = "darkorange", alpha = 0.5) +
-  geom_vline(
-    xintercept = median(copy_metrics$mean_fano[copy_metrics$metric_used == "Fano"],
-                        na.rm = TRUE),
-    linetype = "dashed", colour = "firebrick", linewidth = 0.9
-  ) +
+ggsave(file.path(OUT_DIR, "plots", "01_cv_histogram_TE_vs_gene.pdf"),
+       p01, width = 10, height = 5)
+cat("  -> 01_cv_histogram_TE_vs_gene.pdf saved\n")
+
+
+# Plot 2: CV histogram by condition (TEs only) ---------------------------------
+# Shows whether quantification uncertainty shifts between conditions.
+# Each curve aggregates all TE copies from samples in that condition.
+# Dashed lines mark the median per condition.
+
+cv_cond_long <- data.frame(
+  condition = rep(condition_levels, each = nrow(copy_metrics)),
+  cv        = c(copy_metrics$mean_cv_control,
+                copy_metrics$mean_cv_drought,
+                copy_metrics$mean_cv_rewatering)
+) %>%
+  filter(!is.na(cv)) %>%
+  mutate(condition = factor(condition, levels = condition_levels))
+
+med_cond <- cv_cond_long %>%
+  group_by(condition) %>%
+  summarise(med = median(cv, na.rm = TRUE), .groups = "drop")
+
+p02 <- ggplot(cv_cond_long,
+              aes(x = cv, fill = condition, colour = condition)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 80, alpha = 0.4, position = "identity") +
+  geom_density(alpha = 0, linewidth = 0.8) +
+  geom_vline(data = med_cond,
+             aes(xintercept = med, colour = condition),
+             linetype = "dashed", linewidth = 0.9) +
+  scale_fill_manual(values   = condition_colors) +
+  scale_colour_manual(values = condition_colors) +
   labs(
-    title    = "1B: Fano distribution (lowly expressed TEs)",
-    subtitle = paste0("mean TPM < ", TPM_THRESHOLD, " — n = ", n_fano_regime, " TEs"),
-    x = "Mean Fano index",
-    y = "Density"
+    title    = "Plot 02: TE quantification uncertainty by condition",
+    subtitle = paste0(n_te, " TE copies; dashed lines = medians per condition"),
+    x        = "Mean CV",
+    y        = "Density",
+    fill     = "Condition",
+    colour   = "Condition"
   ) +
   THEME_BASE
 
-pdf(file.path(OUT_DIR, "plots", "01_uncertainty_distribution.pdf"),
-    width = 8, height = 9)
-gridExtra::grid.arrange(p1a, p1b, ncol = 1)
-dev.off()
-cat("  -> 01_uncertainty_distribution.pdf saved\n")
+ggsave(file.path(OUT_DIR, "plots", "02_cv_histogram_by_condition.pdf"),
+       p02, width = 9, height = 5)
+cat("  -> 02_cv_histogram_by_condition.pdf saved\n")
 
 
-# Plot 2: Expression level vs hybrid uncertainty ------------------------------
+# Plot 3: CV violin + boxplot by condition (TEs only) --------------------------
+# Directly compares uncertainty distributions across the three conditions.
+# The violin shows the full distribution; the embedded boxplot shows
+# median and IQR.
 
-top_sf <- names(sort(table(copy_metrics$superfamily), decreasing = TRUE))[1:8]
-
-copy_metrics$superfamily_plot <- ifelse(
-  copy_metrics$superfamily %in% top_sf,
-  copy_metrics$superfamily,
-  "Other"
-)
-
-sf_order <- c(sort(top_sf), "Other")
-copy_metrics$superfamily_plot <- factor(copy_metrics$superfamily_plot,
-                                        levels = sf_order)
-
-sf_colors <- c(
-  "#E69F00", "#56B4E9", "#009E73", "#F0E442",
-  "#0072B2", "#D55E00", "#CC79A7", "#999999", "#444444"
-)
-names(sf_colors) <- sf_order
-
-p2 <- ggplot(
-  copy_metrics,
-  aes(x = log10(mean_tpm + 0.01), y = hybrid_uncertainty,
-      colour = superfamily_plot)
-) +
-  geom_point(size = 0.8, alpha = 0.35) +
-  geom_smooth(method = "loess", colour = "black", se = TRUE, linewidth = 0.8) +
-  geom_vline(
-    xintercept = log10(TPM_THRESHOLD + 0.01),
-    linetype = "dashed", colour = "grey30", linewidth = 0.8
-  ) +
-  annotate(
-    "text",
-    x = log10(TPM_THRESHOLD + 0.01) + 0.05,
-    y = Inf, vjust = 2, hjust = 0, size = 3.2, colour = "grey30",
-    label = paste0("Threshold = ", TPM_THRESHOLD, " TPM")
-  ) +
-  scale_colour_manual(values = sf_colors) +
-  guides(colour = guide_legend(override.aes = list(size = 3, alpha = 1), ncol = 1)) +
+p03 <- ggplot(cv_cond_long,
+              aes(x = condition, y = cv, fill = condition)) +
+  geom_violin(trim = TRUE, alpha = 0.5, scale = "width") +
+  geom_boxplot(width = 0.15, fill = "white",
+               outlier.size = 0.4, outlier.alpha = 0.3) +
+  scale_fill_manual(values = condition_colors) +
   labs(
-    title    = "Plot 2: Expression level vs Uncertainty",
-    subtitle = "Top 8 superfamilies shown; remaining collapsed into 'Other'",
-    x        = "log10(mean TPM + 0.01)",
-    y        = "Hybrid uncertainty metric",
-    colour   = "Superfamily"
+    title    = "Plot 03: CV distribution per condition (TEs)",
+    subtitle = "Violin + boxplot aggregating all TE copies",
+    x        = "Condition",
+    y        = "Mean CV",
+    fill     = "Condition"
   ) +
   THEME_BASE +
-  theme(legend.text = element_text(size = 9))
+  theme(legend.position = "none")
 
-ggsave(file.path(OUT_DIR, "plots", "02_abundance_vs_uncertainty.pdf"),
-       p2, width = 10, height = 6)
-cat("  -> 02_abundance_vs_uncertainty.pdf saved\n")
+ggsave(file.path(OUT_DIR, "plots", "03_cv_boxplot_by_condition.pdf"),
+       p03, width = 7, height = 5)
+cat("  -> 03_cv_boxplot_by_condition.pdf saved\n")
 
 
-# Plot 3: Boxplot — CV by family (top 25) -------------------------------------
+# Plot 4: Expression profiles with error bars — top N uncertain TEs ------------
+# For each of the top N most uncertain TEs, one panel shows the expression
+# profile across all samples, with error bars representing the uncertainty.
+#
+# X  = sample (grouped and coloured by condition)
+# Y  = mean of scaled Gibbs replicates (expression estimate)
+# Error bars = ±1 SD of Gibbs replicates (quantification uncertainty)
+#
+# A wide error bar means the Salmon posterior is spread — the true count
+# for that TE in that sample is poorly constrained.
 
-top25_families <- family_metrics %>%
-  arrange(desc(n_copies)) %>%
-  slice_head(n = 25) %>%
-  pull(family)
+top_te_ids <- head(copy_metrics$te_copy, N_TOP_TE_PROFILES)
 
-copy_top25 <- copy_metrics %>% filter(family %in% top25_families)
+profile_list <- list()
 
-p3 <- ggplot(copy_top25,
-             aes(x = reorder(family, mean_cv, FUN = median), y = mean_cv)) +
-  geom_boxplot(fill = "steelblue", alpha = 0.6,
-               outlier.size = 0.5, outlier.alpha = 0.3) +
-  coord_flip() +
+for (te in top_te_ids) {
+  idx <- which(te_names == te)
+  if (length(idx) == 0) next
+  profile_list[[te]] <- data.frame(
+    te_copy   = te,
+    sample    = samples,
+    condition = conditions_vector,
+    mean_expr = as.numeric(mat_mean[idx, ]),
+    sd_expr   = as.numeric(mat_sd[idx, ]),
+    stringsAsFactors = FALSE
+  )
+}
+
+profile_df <- bind_rows(profile_list) %>%
+  mutate(
+    condition = factor(condition, levels = condition_levels),
+    sample    = factor(sample,
+                       levels = samples[order(conditions_vector,
+                                              method = "radix")])
+  )
+
+p05 <- ggplot(profile_df,
+              aes(x = sample, y = mean_expr,
+                  colour = condition, group = te_copy)) +
+  geom_errorbar(aes(ymin = mean_expr - sd_expr,
+                    ymax = mean_expr + sd_expr),
+                width = 0.3, alpha = 0.7) +
+  geom_point(size = 2.5) +
+  geom_line(alpha = 0.5) +
+  scale_colour_manual(values = condition_colors) +
+  facet_wrap(~ te_copy, scales = "free_y",
+             ncol = 3, labeller = label_wrap_gen(25)) +
   labs(
-    title    = "Plot 3: CV distribution by TE family",
-    subtitle = "Top 25 families by number of copies; ordered by median CV",
-    x        = "Family",
-    y        = "Mean CV"
+    title    = paste0("Plot 04: Expression profiles — top ",
+                      N_TOP_TE_PROFILES, " most uncertain TEs"),
+    subtitle = "Points = mean of Gibbs replicates; error bars = \u00b11 SD",
+    x        = "Sample",
+    y        = "Mean expression (scaled Gibbs replicates)",
+    colour   = "Condition"
   ) +
-  THEME_BASE
+  THEME_BASE +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+        strip.text  = element_text(size = 7))
 
-ggsave(file.path(OUT_DIR, "plots", "03_cv_by_family_boxplot.pdf"),
-       p3, width = 9, height = 9)
-cat("  -> 03_cv_by_family_boxplot.pdf saved\n")
-
-
-# Plot 4: Heatmap — CV per sample (top 40 per sample) -------------------------
-
-# ==============================================================================
-# CUSTOMIZE APPEARANCE HERE
-# ==============================================================================
-
-condition_colors <- list(
-  " " = c(
-    "control" = "#56B4E9",
-    "drought" = "#E69F00"
-  )
-)
-
-title_fontsize     <- 13        # font size in points
-title_fontface     <- "bold"    # "plain", "bold", "italic", "bold.italic"
-title_margin_lines <- 2         # blank lines between title and heatmap body
-cell_border_color  <- "white"   # "NA" = no border
-
-# ==============================================================================
-
-for (s in samples) {
-  
-  cv_sample <- mat_cv[, s]
-  valid_te  <- names(cv_sample)[!is.na(cv_sample) & !is.nan(cv_sample) &
-                                  !is.infinite(cv_sample)]
-  
-  cat("Sample", s, "— TEs with valid CV:", length(valid_te), "\n")
-  
-  if (length(valid_te) < 2) {
-    cat("  -> Heatmap skipped for", s, ": fewer than 2 valid TEs.\n")
-    next
-  }
-  
-  top_n    <- min(40, length(valid_te))
-  top40_te <- names(sort(cv_sample[valid_te], decreasing = TRUE))[1:top_n]
-  
-  mat_sub <- mat_cv[top40_te, , drop = FALSE]
-  
-  # Impute remaining NAs with row mean
-  mat_sub <- t(apply(mat_sub, 1, function(row) {
-    row[is.na(row)] <- mean(row, na.rm = TRUE)
-    row
-  }))
-  
-  # Title with spacing
-  title_padding <- paste(rep("\n", title_margin_lines), collapse = "")
-  plot_title    <- paste0("CV — Top ", top_n,
-                          " most uncertain TEs in ", s, title_padding)
-  
-  annotation_columns <- data.frame(
-    " "         = as.character(colData(se)$condition),
-    row.names   = colnames(se),
-    check.names = FALSE
-  )
-  
-  outfile <- file.path(OUT_DIR, "plots",
-                       paste0("04_heatmap_cv_top40_", s, ".pdf"))
-  
-  saved <- tryCatch({
-    pdf(outfile, width = max(8, n_samples * 0.7 + 3), height = 10)
-    pheatmap(
-      mat_sub,
-      color             = viridis(100),
-      cluster_rows      = FALSE,
-      cluster_cols      = FALSE,
-      annotation_col    = annotation_columns,
-      annotation_colors = condition_colors,
-      show_rownames     = TRUE,
-      show_colnames     = TRUE,
-      fontsize_row      = 7,
-      border_color      = cell_border_color,
-      main              = plot_title,
-      na_col            = "grey80",
-      fontsize          = 10,
-      main_fontface     = title_fontface,
-      main_fontsize     = title_fontsize,
-      silent            = FALSE
-    )
-    dev.off()
-    cat("  ->", basename(outfile), "saved\n")
-    TRUE
-  }, error = function(e) {
-    if (dev.cur() > 1) dev.off()
-    cat("  ERROR for", s, ":", conditionMessage(e), "\n")
-    FALSE
-  })
-}
+ggsave(file.path(OUT_DIR, "plots", "04_expression_profiles_top_TEs.pdf"),
+       p05,
+       width  = 14,
+       height = ceiling(N_TOP_TE_PROFILES / 3) * 3.5 + 2)
+cat("  -> 04_expression_profiles_top_TEs.pdf saved\n\n")
 
 
-# Plot 5: Violin — CV per sample (skipped if only one sample) -----------------
-
-if (n_samples > 1) {
-  
-  cv_long <- as.data.frame(mat_cv) %>%
-    mutate(te_copy = te_names) %>%
-    pivot_longer(
-      cols      = all_of(samples),
-      names_to  = "sample",
-      values_to = "cv"
-    ) %>%
-    left_join(conditions[, c("sample", "condition")], by = "sample") %>%
-    filter(!is.na(cv))
-  
-  p5 <- ggplot(cv_long, aes(x = sample, y = cv, fill = condition)) +
-    geom_violin(trim = TRUE, alpha = 0.7, scale = "width") +
-    geom_boxplot(width = 0.1, fill = "white",
-                 outlier.size = 0.3, alpha = 0.9) +
-    labs(
-      title    = "Plot 5: CV distribution per sample",
-      subtitle = "Each violin = all TEs in that sample",
-      x        = "Sample",
-      y        = "CV (SD / mean of Gibbs replicates)",
-      fill     = "Condition"
-    ) +
-    THEME_BASE +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-  
-  ggsave(file.path(OUT_DIR, "plots", "05_cv_violin_per_sample.pdf"),
-         p5, width = max(8, n_samples * 0.8 + 2), height = 6)
-  cat("  -> 05_cv_violin_per_sample.pdf saved\n\n")
-  
-} else {
-  cat("  -> Plot 5 skipped: only one sample available.\n\n")
-}
-
-
-# ==============================================================================
-# STEP 12: Final summary
-# ==============================================================================
+# ------------------------------------------------------------------------------
+# Final summary
+# ------------------------------------------------------------------------------
 
 n_complete_te <- sum(complete.cases(mat_cv))
 
 cat("=======================================================================\n")
 cat("ANALYSIS COMPLETE\n")
 cat("=======================================================================\n")
-cat("TEs analysed:              ", n_te,        "\n")
-cat("Samples:                   ", n_samples,   "\n")
-cat("Gibbs replicates:          ", n_gibbs,     "\n")
+cat("TEs analysed:              ", n_te,      "\n")
+cat("Protein-coding genes:      ", n_gene,    "\n")
+cat("Samples:                   ", n_samples, "\n")
+cat("Gibbs replicates:          ", n_gibbs,   "\n")
 cat("Families found:            ", length(unique(copy_metrics$family)), "\n")
 cat("TEs with complete CV data: ", n_complete_te,
     "(", round(n_complete_te / n_te * 100, 1), "% of total)\n")
-cat("TEs using CV metric:       ", n_cv_regime,   "\n")
-cat("TEs using Fano metric:     ", n_fano_regime, "\n")
-cat("\nGlobal mean CV:            ",
-    round(mean(copy_metrics$mean_cv, na.rm = TRUE), 4), "\n")
-cat("Global median CV:          ",
-    round(median(copy_metrics$mean_cv, na.rm = TRUE), 4), "\n")
-cat("Most uncertain TE:         ", copy_metrics$te_copy[1],
-    "(CV =", round(copy_metrics$mean_cv[1], 4), ")\n")
+cat("\nMean CV by condition:\n")
+for (cond in condition_levels) {
+  col <- paste0("mean_cv_", cond)
+  cat("  ", formatC(cond, width = 12, flag = "-"), ":",
+      round(mean(copy_metrics[[col]], na.rm = TRUE), 4), "\n")
+}
+cat("\nGlobal mean CV — TEs:  ",
+    round(mean(global_cv_te,   na.rm = TRUE), 4), "\n")
+cat("Global mean CV — genes:",
+    round(mean(global_cv_gene, na.rm = TRUE), 4), "\n")
+cat("\nMost uncertain TE:         ", copy_metrics$te_copy[1],
+    "(CV =", round(copy_metrics$mean_cv_global[1], 4), ")\n")
 cat("\nOutput files saved in:", OUT_DIR, "\n")
 cat("  tables/\n")
 cat("    uncertainty_by_copy.tsv\n")
 cat("    uncertainty_by_family.tsv\n")
 cat("  plots/\n")
-cat("    01_uncertainty_distribution.pdf\n")
-cat("    02_abundance_vs_uncertainty.pdf\n")
-cat("    03_cv_by_family_boxplot.pdf\n")
-cat("    04_heatmap_cv_top40_<sample>.pdf  (one per sample)\n")
-if (n_samples > 1) cat("    05_cv_violin_per_sample.pdf\n")
+cat("    01_cv_histogram_TE_vs_gene.pdf\n")
+cat("    02_cv_histogram_by_condition.pdf\n")
+cat("    03_cv_boxplot_by_condition.pdf\n")
+cat("    04_expression_profiles_top_TEs.pdf\n")
 cat("=======================================================================\n")
 
 sessionInfo()
