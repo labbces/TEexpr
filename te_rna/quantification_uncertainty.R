@@ -324,15 +324,16 @@ feature_class <- data.frame(
 #   Robust spread; less sensitive to extreme replicates.
 #
 # phi (inferential overdispersion) = variance / mean
-#   Moment estimator of mapping ambiguity, as in Chen et al. (NAR, 2024) and
-#   Smyth et al. (NAR Genomics and Bioinformatics, 2024).
+#   Moment estimator of mapping ambiguity, as in Baldoni et al.
+#   (Nucleic Acids Research, 2024, 52(3):e13).
 #   Note: after scaleInfReps() the replicates are depth-adjusted, so phi
 #   reflects scaled inferential overdispersion rather than quasi-Poisson
 #   dispersion in the strict count-model sense.
 #   rowVars() uses Bessel's correction (divides by n − 1).
 #
 # InfRV (Inferential Relative Variance) = max(var / mean² − 1/mean, 0)
-#   Canonical fishpond metric (Zhu et al., 2019).  Subtracts the Poisson
+#   Canonical fishpond metric introduced by Zhu et al.
+#   (Nucleic Acids Research, 2019, 47(18):e105).  Subtracts the Poisson
 #   sampling component (1/mean) from the squared CV, isolating the excess
 #   variance due to read-assignment ambiguity.  More stable than CV for
 #   features with moderate-to-high expression.  Computed via
