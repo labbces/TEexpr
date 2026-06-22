@@ -10,7 +10,6 @@
 
 library(ggplot2)
 library(dplyr)
-library(tidyverse)
 library(viridis)
 library(patchwork)
 library(DESeq2)
