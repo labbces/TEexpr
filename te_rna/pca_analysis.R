@@ -3,10 +3,6 @@
 # Supports: multi-experiment mode and single-experiment mode
 # Groups: control | drought | rehydration (rehydration merged with drought)
 # ============================================================================
-# DEPENDENCIES:
-#   install.packages(c("ggplot2", "dplyr", "tidyverse", "viridis", "patchwork", "ggrepel"))
-#   BiocManager::install(c("DESeq2", "tximport"))
-# ============================================================================
 
 library(ggplot2)
 library(dplyr)
@@ -173,7 +169,13 @@ find_sf_files <- function(salmon_root, species_tag) {
 
   all_sf <- c()
   for (sp_dir in species_dirs) {
-    sample_dirs <- list.dirs(sp_dir, recursive = FALSE, full.names = TRUE)
+    # Structure: <sp_dir>/salmon_results/<SRR>/quant.sf
+    results_dir <- file.path(sp_dir, "salmon_results")
+    if (!dir.exists(results_dir)) {
+      cat(sprintf("  Warning: salmon_results not found under %s\n", sp_dir))
+      next
+    }
+    sample_dirs <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
     sf_paths    <- file.path(sample_dirs, "quant.sf")
     found       <- sf_paths[file.exists(sf_paths)]
     all_sf      <- c(all_sf, found)
