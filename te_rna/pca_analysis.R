@@ -34,6 +34,8 @@ cli_species    <- parse_arg(args, "--species")
 cli_salmon     <- parse_arg(args, "--salmon_root")
 cli_metadata   <- parse_arg(args, "--metadata")
 cli_output     <- parse_arg(args, "--output_dir")
+cli_multi_runs <- parse_arg(args, "--multi_runs")        # path to .txt with one SRR per line
+cli_single_bp  <- parse_arg(args, "--single_bioproject")
 
 # ============================================================================
 # PARAMETERS — change these for each species/run
@@ -59,7 +61,11 @@ output_dir        <- if (!is.null(cli_output))   cli_output   else file.path("~/
 mode              <- "both"
 
 # --- For single-experiment mode: which bioproject to use? ---
-single_bioproject <- "PRJNA882367"
+single_bioproject <- if (!is.null(cli_single_bp)) cli_single_bp else "PRJNA882367"  # overridden by --single_bioproject
+
+# --- For multi-experiment mode: optional whitelist of SRRs (one per line in a .txt) ---
+# If provided, ONLY these runs are used in the multi PCA. If NULL, all available runs are used.
+multi_runs_file   <- if (!is.null(cli_multi_runs)) cli_multi_runs else NULL  # set via --multi_runs
 
 # --- CV filter threshold (keep genes with CV >= this value) ---
 cv_threshold      <- 0.15
@@ -384,7 +390,46 @@ plots <- list()
 if (mode %in% c("multi", "both")) {
   cat("\n[MULTI] Building multi-experiment PCA...\n")
 
-  coldata_multi            <- meta_matched
+  # Optional whitelist of SRRs for the multi analysis
+  if (!is.null(multi_runs_file)) {
+    if (!file.exists(multi_runs_file))
+      stop(sprintf("multi_runs file not found: %s", multi_runs_file))
+
+    multi_runs <- readLines(multi_runs_file)
+    multi_runs <- trimws(multi_runs)
+    multi_runs <- multi_runs[nchar(multi_runs) > 0]   # drop blank lines
+
+    cat(sprintf("  Whitelist provided (%s): %d SRRs requested\n",
+                multi_runs_file, length(multi_runs)))
+
+    runs_found   <- intersect(multi_runs, rownames(meta_matched))
+    runs_missing <- setdiff(multi_runs, rownames(meta_matched))
+
+    if (length(runs_missing) > 0)
+      cat(sprintf("  Warning: %d whitelisted SRRs not found in data and skipped: %s\n",
+                  length(runs_missing), paste(runs_missing, collapse = ", ")))
+
+    if (length(runs_found) == 0)
+      stop("None of the whitelisted SRRs were found in the available data.")
+
+    cat(sprintf("  Using %d SRRs for multi-experiment PCA\n", length(runs_found)))
+
+    meta_m <- meta_matched[runs_found, , drop = FALSE]
+    idx_m  <- which(colnames(txi_all$counts) %in% runs_found)
+    txi_m  <- list(
+      counts              = txi_all$counts[, idx_m, drop = FALSE],
+      abundance           = txi_all$abundance[, idx_m, drop = FALSE],
+      length              = txi_all$length[, idx_m, drop = FALSE],
+      countsFromAbundance = txi_all$countsFromAbundance
+    )
+    class(txi_m) <- "list"
+  } else {
+    cat(sprintf("  No whitelist provided — using all %d available SRRs\n", nrow(meta_matched)))
+    meta_m <- meta_matched
+    txi_m  <- txi_all
+  }
+
+  coldata_multi            <- meta_m
   coldata_multi$treatment  <- factor(coldata_multi$treatment,
                                       levels = c("Control", "Drought"))
   coldata_multi$genotype   <- as.factor(coldata_multi$genotype)
@@ -403,7 +448,7 @@ if (mode %in% c("multi", "both")) {
   }
 
   plots[["multi"]] <- build_pca_plot(
-    txi       = txi_all,
+    txi       = txi_m,
     coldata   = coldata_multi,
     color_col = "genotype",
     shape_col = "treatment",
