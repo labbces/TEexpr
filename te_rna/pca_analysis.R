@@ -3,6 +3,8 @@
 # Supports: multi-experiment mode and single-experiment mode
 # Groups: control | drought | rehydration (rehydration merged with drought)
 # ============================================================================
+# DEPENDENCIES
+# ============================================================================
 
 library(ggplot2)
 library(dplyr)
@@ -14,8 +16,6 @@ library(ggrepel)
 
 # ============================================================================
 # COMMAND-LINE ARGUMENTS
-# Cluster: Rscript pca_drought.R --species Sbicolor
-# Interactive (RStudio): species_tag defined below is used as fallback
 # ============================================================================
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -251,9 +251,11 @@ build_pca_plot <- function(txi, coldata, color_col, shape_col = NULL,
   dds          <- dds[rownames(raw_filtered), ]
   dds          <- estimateSizeFactors(dds)
 
-  vst      <- varianceStabilizingTransformation(dds, blind = TRUE)
-  pca_data <- plotPCA(vst, intgroup = c(color_col, shape_col),
-                      returnData = TRUE, ntop = pca_top_genes)
+  vst         <- varianceStabilizingTransformation(dds, blind = TRUE)
+  intgroup    <- unique(c(color_col, shape_col, label_col))  # include label_col if provided
+  intgroup    <- intgroup[!is.na(intgroup) & intgroup %in% colnames(colData(vst))]
+  pca_data    <- plotPCA(vst, intgroup = intgroup,
+                         returnData = TRUE, ntop = pca_top_genes)
   pct_var  <- round(100 * attr(pca_data, "percentVar"))
 
   if (!is.null(shape_col)) {
@@ -415,8 +417,9 @@ if (mode %in% c("multi", "both")) {
 
     cat(sprintf("  Using %d SRRs for multi-experiment PCA\n", length(runs_found)))
 
-    meta_m <- meta_matched[runs_found, , drop = FALSE]
-    idx_m  <- which(colnames(txi_all$counts) %in% runs_found)
+    meta_m <- meta_matched[meta_matched$run %in% runs_found, , drop = FALSE]
+    meta_m <- meta_m[order(match(meta_m$run, colnames(txi_all$counts))), ]
+    idx_m  <- match(meta_m$run, colnames(txi_all$counts))
     txi_m  <- list(
       counts              = txi_all$counts[, idx_m, drop = FALSE],
       abundance           = txi_all$abundance[, idx_m, drop = FALSE],
@@ -426,11 +429,12 @@ if (mode %in% c("multi", "both")) {
     class(txi_m) <- "list"
   } else {
     cat(sprintf("  No whitelist provided — using all %d available SRRs\n", nrow(meta_matched)))
-    meta_m <- meta_matched
+    meta_m <- meta_matched[order(match(meta_matched$run, colnames(txi_all$counts))), ]
     txi_m  <- txi_all
   }
 
   coldata_multi            <- meta_m
+  rownames(coldata_multi)  <- coldata_multi$run
   coldata_multi$treatment  <- factor(coldata_multi$treatment,
                                       levels = c("Control", "Drought"))
   coldata_multi$genotype   <- as.factor(coldata_multi$genotype)
@@ -481,7 +485,12 @@ if (mode %in% c("single", "both")) {
   meta_single <- meta_matched %>% filter(bioproject == single_bioproject)
   cat(sprintf("  Bioproject: %s | Samples: %d\n", single_bioproject, nrow(meta_single)))
 
-  idx        <- which(colnames(txi_all$counts) %in% meta_single$run)
+  # Align coldata and txi to same samples in same order
+  runs_single <- intersect(meta_single$run, colnames(txi_all$counts))
+  meta_single <- meta_single[meta_single$run %in% runs_single, , drop = FALSE]
+  meta_single <- meta_single[order(match(meta_single$run, colnames(txi_all$counts))), ]
+
+  idx        <- match(meta_single$run, colnames(txi_all$counts))
   txi_single <- list(
     counts              = txi_all$counts[, idx, drop = FALSE],
     abundance           = txi_all$abundance[, idx, drop = FALSE],
@@ -491,6 +500,7 @@ if (mode %in% c("single", "both")) {
   class(txi_single) <- "list"
 
   coldata_single           <- meta_single
+  rownames(coldata_single) <- coldata_single$run
   coldata_single$treatment <- factor(coldata_single$treatment,
                                       levels = c("Control", "Drought"))
   coldata_single$genotype  <- as.factor(coldata_single$genotype)
