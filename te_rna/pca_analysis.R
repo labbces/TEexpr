@@ -74,11 +74,12 @@ merge_rehydration <- TRUE
 # --- Paleta de cores por genótipo ---
 # Uma cor por genótipo, na ordem em que aparecem nos metadados.
 # Se NULL, usa viridis automaticamente.
-colours_multi <- c("#bf7e46", "#ba4134", "#949941", "#ddc5a9",
-                   "#5d556a", "#592E29", "#b03060", "#1a657a",
-                   "#40afaf", "#392a6f", "#3a5f0b", "#6a4e42",
-                   "#be6584", "#4b7f52", "#6a7375", "#810036",
-                   "#7f5a83", "#f5c74d", "#8894b7", "#d97443")
+#colours_multi <- c("#bf7e46", "#ba4134", "#949941", "#ddc5a9",
+#                   "#5d556a", "#592E29", "#b03060", "#1a657a",
+#                   "#40afaf", "#392a6f", "#3a5f0b", "#6a4e42",
+#                   "#be6584", "#4b7f52", "#6a7375", "#810036",
+#                   "#7f5a83", "#f5c74d", "#8894b7", "#d97443")
+colours_multi <- NULL
 
 # --- Formas por tratamento ---
 # 16 = círculo (preenchido), 17 = triângulo (preenchido)
@@ -121,9 +122,18 @@ build_tx2gene <- function(sf_files) {
   te_ids   <- sf_names[is_te]
 
   # -- 2. GENES: remove the isoform suffix (.1, .2, ...) ----------------------
+  # Remove isoform suffix — handles multiple patterns:
+  #   Sobic.010G000100.1  -> Sobic.010G000100  (suffix: .N)
+  #   Sof_g2.t1           -> Sof_g2            (suffix: .tN)
+  #   Zm00001eb000010_T001 -> Zm00001eb000010   (suffix: _TN or _tN)
+  gene_id_clean <- gene_ids
+  gene_id_clean <- sub("\\.[Tt]\\d+$", "", gene_id_clean)   # remove .t1, .T1
+  gene_id_clean <- sub("\\.\\d+$",     "", gene_id_clean)   # remove .1, .2
+  gene_id_clean <- sub("_[Tt]\\d+$",    "", gene_id_clean)   # remove _T001, _t1
+
   gene_rows <- data.frame(
     tx_id   = gene_ids,
-    gene_id = sub("\\.\\d+$", "", gene_ids),
+    gene_id = gene_id_clean,
     stringsAsFactors = FALSE
   ) %>% distinct()
 
@@ -378,8 +388,8 @@ txi_all <- tximport(
   files           = sf_matched,
   type            = "salmon",
   tx2gene         = tx2gene,
-  ignoreTxVersion = TRUE,
-  ignoreAfterBar  = TRUE
+  ignoreTxVersion = FALSE,
+  ignoreAfterBar  = FALSE
 )
 cat(sprintf("  Imported | Samples: %d | Genes (pre-filter): %d\n",
             ncol(txi_all$counts), nrow(txi_all$counts)))
