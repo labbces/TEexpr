@@ -33,7 +33,7 @@ cli_multi_runs <- parse_arg(args, "--multi_runs")        # path to .txt with one
 cli_single_bp  <- parse_arg(args, "--single_bioproject")
 
 # ============================================================================
-# PARAMETERS — change these for each species/run
+# PARAMETERS
 # ============================================================================
 
 # --- Species tag (used to find sample folders by prefix) ---
@@ -71,35 +71,84 @@ pca_top_genes     <- 1000
 # --- Merge rehydration into drought? ---
 merge_rehydration <- TRUE
 
-# --- Paleta de cores por genótipo ---
-# Uma cor por genótipo, na ordem em que aparecem nos metadados.
-# Se NULL, usa viridis automaticamente.
-#colours_multi <- c("#bf7e46", "#ba4134", "#949941", "#ddc5a9",
-#                   "#5d556a", "#592E29", "#b03060", "#1a657a",
-#                   "#40afaf", "#392a6f", "#3a5f0b", "#6a4e42",
-#                   "#be6584", "#4b7f52", "#6a7375", "#810036",
-#                   "#7f5a83", "#f5c74d", "#8894b7", "#d97443")
-colours_multi <- NULL
+# --- Colour palette (msc_palette — 40 colours) ---
+# Organised in 10 hue families. If NULL, falls back to viridis automatically.
+colours_multi <- c(
+  # Dark Mahogany
+  "#300B07", "#481B17", "#592E29", "#734C48",
+  # Crimson Clay
+  "#6A0A00", "#952418", "#ba4134", "#D8675B",
+  # Caramel
+  "#4C2300", "#723908", "#9E5D25", "#bf7e46",
+  # Saffron
+  "#936805", "#B4851A", "#DBA938", "#f5c75d",
+  # Olive Drab
+  "#52560B", "#787D24", "#949941", "#B6BB64",
+  # Verde/Ciano
+  "#5C8C3A", "#3A8C6A", "#3A8C8C", "#3A6A8C",
+  # Teal Blue
+  "#023A4A", "#0D5063", "#1a657a", "#317689",
+  # Steel Blue
+  "#0A1842", "#38497C", "#5E6D9A", "#8894b7",
+  # Dusty Plum
+  "#1F1631", "#2A2238", "#433C50", "#5d556a",
+  # Raspberry
+  "#2D0011", "#4F001D", "#70032B", "#b03060"
+)
 
-# --- Formas por tratamento ---
-# 16 = círculo (preenchido), 17 = triângulo (preenchido)
+# --- Anchor colours — one per family, used first for small genotype counts ---
+# With <= 10 genotypes: only anchors are used (maximum contrast).
+# With > 10 genotypes: full palette is sampled evenly.
+colours_anchors <- c(
+  "#592E29",  # Dark Mahogany
+  "#ba4134",  # Crimson Clay
+  "#bf7e46",  # Caramel
+  "#f5c75d",  # Saffron
+  "#949941",  # Olive Drab
+  "#5C8C3A",  # Verde/Ciano
+  "#1a657a",  # Teal Blue
+  "#8894b7",  # Steel Blue
+  "#5d556a",  # Dusty Plum
+  "#b03060"   # Raspberry
+)
+
+# --- Treatment shapes ---
+# 16 = circle (filled), 17 = triangle (filled)
 shapes_treatment <- c(Control = 16, Drought = 17)
 
-# --- Títulos dos plots ---
-title_multi  <- sprintf("%s — Múltiplos experimentos\n(cor = genótipo, forma = tratamento, rótulo = experimento)", species_tag)
-title_single <- sprintf("%s — %s\n(cor = genótipo, forma = tratamento)", species_tag, single_bioproject)
+# --- Plot titles ---
+title_multi  <- sprintf("%s — Multi-experiment", species_tag)
+# title_single is computed dynamically in the SINGLE block below
 
 # --- Nomes das legendas ---
-legend_treatment  <- "Tratamento"
-legend_genotype   <- "Genótipo"
-legend_experiment <- "Experimento"
+legend_treatment  <- "Treatment"
+legend_genotype   <- "Genotype"
+legend_experiment <- "Experiment"
 
-# --- Rótulos de tratamento (aparecem na legenda) ---
-labels_treatment <- c(Control = "Controle", Drought = "Seca")
+# --- Treatment labels (shown in legend) ---
+labels_treatment <- c(Control = "Control", Drought = "Drought")
 
 # ============================================================================
 # HELPERS
 # ============================================================================
+
+#' Select colours for n genotypes:
+#' - if n <= 10: sample evenly from anchors (one per family, max contrast)
+#' - if n > 10:  sample evenly from full palette
+select_colours <- function(n, anchors = colours_anchors, palette = colours_multi) {
+  if (is.null(palette) && is.null(anchors)) return(NULL)
+  if (n <= length(anchors)) {
+    idx <- round(seq(1, length(anchors), length.out = n))
+    return(anchors[idx])
+  } else if (!is.null(palette) && length(palette) >= n) {
+    idx <- round(seq(1, length(palette), length.out = n))
+    return(palette[idx])
+  } else {
+    warning(sprintf("Not enough colours (%d) for %d genotypes — falling back to viridis.",
+                    length(palette), n))
+    return(NULL)
+  }
+}
 
 #' Build a hybrid tx2gene entirely from quant.sf IDs — no GTF needed.
 #'
@@ -180,12 +229,16 @@ find_sf_files <- function(salmon_root, species_tag) {
   all_sf <- c()
   for (sp_dir in species_dirs) {
     # Structure: <sp_dir>/salmon_results/<SRR>/quant.sf
+    # Support both structures:
+    #   cluster: <sp_dir>/salmon_results/<SRR>/quant.sf
+    #   local:   <sp_dir>/<SRR>/quant.sf
     results_dir <- file.path(sp_dir, "salmon_results")
-    if (!dir.exists(results_dir)) {
-      cat(sprintf("  Warning: salmon_results not found under %s\n", sp_dir))
-      next
+    if (dir.exists(results_dir)) {
+      sample_dirs <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
+    } else {
+      cat(sprintf("  Note: no salmon_results subdir, reading directly from %s\n", sp_dir))
+      sample_dirs <- list.dirs(sp_dir, recursive = FALSE, full.names = TRUE)
     }
-    sample_dirs <- list.dirs(results_dir, recursive = FALSE, full.names = TRUE)
     sf_paths    <- file.path(sample_dirs, "quant.sf")
     found       <- sf_paths[file.exists(sf_paths)]
     all_sf      <- c(all_sf, found)
@@ -228,13 +281,29 @@ load_metadata <- function(metadata_file, species_tag, merge_rehydration) {
 
 
 #' Coefficient-of-variation filter on raw count matrix
+#' Reports genes vs TEs separately in log output
 filter_by_cv <- function(counts_mat, cv_threshold) {
   gene_means <- rowMeans(counts_mat)
   gene_sds   <- apply(counts_mat, 1, sd)
   cv         <- ifelse(gene_means == 0, 0, gene_sds / gene_means)
   keep       <- cv >= cv_threshold
-  cat(sprintf("  CV filter (>= %.0f%%): keeping %d / %d genes\n",
-              cv_threshold * 100, sum(keep), length(keep)))
+
+  # Separate genes and TEs by ID prefix
+  all_ids    <- rownames(counts_mat)
+  is_te      <- startsWith(all_ids, "TE_")
+  kept_ids   <- all_ids[keep]
+  kept_te    <- startsWith(kept_ids, "TE_")
+
+  n_genes_in  <- sum(!is_te);  n_genes_out <- sum(!kept_te)
+  n_te_in     <- sum(is_te);   n_te_out    <- sum(kept_te)
+
+  cat(sprintf("  CV filter (>= %.0f%%):\n", cv_threshold * 100))
+  cat(sprintf("    Genes: %d / %d kept (%.1f%%)\n",
+              n_genes_out, n_genes_in, 100 * n_genes_out / max(n_genes_in, 1)))
+  cat(sprintf("    TEs:   %d / %d kept (%.1f%%)\n",
+              n_te_out,    n_te_in,    100 * n_te_out    / max(n_te_in, 1)))
+  cat(sprintf("    Total: %d / %d kept\n", sum(keep), length(keep)))
+
   counts_mat[keep, , drop = FALSE]
 }
 
@@ -247,7 +316,8 @@ filter_by_cv <- function(counts_mat, cv_threshold) {
 #' @param title     plot title
 #' @param colours   colour vector to use (passed from parameters)
 build_pca_plot <- function(txi, coldata, color_col, shape_col = NULL,
-                           title = "", colours = NULL, label_col = NULL) {
+                           title = "", colours = NULL, label_col = NULL,
+                           subtitle = NULL) {
 
   design_formula <- as.formula(paste("~", color_col))
 
@@ -261,6 +331,14 @@ build_pca_plot <- function(txi, coldata, color_col, shape_col = NULL,
   dds          <- dds[rownames(raw_filtered), ]
   dds          <- estimateSizeFactors(dds)
 
+  # Build gene/TE count subtitle
+  kept_ids      <- rownames(raw_filtered)
+  n_genes_kept  <- sum(!startsWith(kept_ids, "TE_"))
+  n_te_kept     <- sum(startsWith(kept_ids, "TE_"))
+  cv_subtitle   <- sprintf("Genes: %d | TEs: %d (CV >= %.0f%%)",
+                            n_genes_kept, n_te_kept, cv_threshold * 100)
+  if (is.null(subtitle)) subtitle <- cv_subtitle
+
   vst         <- varianceStabilizingTransformation(dds, blind = TRUE)
   intgroup    <- unique(c(color_col, shape_col, label_col))  # include label_col if provided
   intgroup    <- intgroup[!is.na(intgroup) & intgroup %in% colnames(colData(vst))]
@@ -272,7 +350,7 @@ build_pca_plot <- function(txi, coldata, color_col, shape_col = NULL,
     pca_data[[shape_col]] <- as.factor(pca_data[[shape_col]])
     n_shapes <- nlevels(pca_data[[shape_col]])
     if (shape_col == "treatment") {
-      # Formas fixas: círculo = Controle, triângulo = Seca
+      # Fixed shapes: circle = Control, triangle = Drought
       shape_values <- shapes_treatment
     } else {
       filled_shapes <- c(16, 15, 17, 18, 21, 22, 23, 24, 25)
@@ -294,9 +372,12 @@ build_pca_plot <- function(txi, coldata, color_col, shape_col = NULL,
     xlab(paste0("PC1: ", pct_var[1], "% variance")) +
     ylab(paste0("PC2: ", pct_var[2], "% variance")) +
     ggtitle(title) +
+    { if (!is.null(subtitle)) labs(subtitle = subtitle) else NULL } +
     theme_bw(base_size = 14) +
     theme(
       plot.title       = element_text(face = "bold", size = 16, hjust = 0.5,
+                                      margin = margin(b = 4)),
+      plot.subtitle    = element_text(size = 11, hjust = 0.5, colour = "grey40",
                                       margin = margin(b = 8)),
       legend.title     = element_text(face = "bold", size = 12),
       legend.text      = element_text(size = 11),
@@ -450,17 +531,11 @@ if (mode %in% c("multi", "both")) {
   coldata_multi$genotype   <- as.factor(coldata_multi$genotype)
   coldata_multi$plant_code <- as.factor(coldata_multi$plant_code)
 
-  # Build named colour vector matching genotype levels
-  geno_levels <- levels(coldata_multi$genotype)
-  n_geno      <- length(geno_levels)
-  if (!is.null(colours_multi) && length(colours_multi) >= n_geno) {
-    colours_multi_named <- setNames(colours_multi[seq_len(n_geno)], geno_levels)
-  } else {
-    if (!is.null(colours_multi))
-      warning(sprintf("colours_multi has %d colours but %d genotypes — falling back to viridis.",
-                      length(colours_multi), n_geno))
-    colours_multi_named <- NULL
-  }
+  # Build named colour vector — anchors first, full palette if > 10 genotypes
+  geno_levels         <- levels(coldata_multi$genotype)
+  n_geno              <- length(geno_levels)
+  selected            <- select_colours(n_geno)
+  colours_multi_named <- if (!is.null(selected)) setNames(selected, geno_levels) else NULL
 
   plots[["multi"]] <- build_pca_plot(
     txi       = txi_m,
@@ -495,6 +570,10 @@ if (mode %in% c("single", "both")) {
   meta_single <- meta_matched %>% filter(bioproject == single_bioproject)
   cat(sprintf("  Bioproject: %s | Samples: %d\n", single_bioproject, nrow(meta_single)))
 
+  # Use plant_codes from this experiment for the title (matching panel A labels)
+  plant_codes_single <- paste(sort(unique(meta_single$plant_code)), collapse = ", ")
+  title_single       <- sprintf("%s — %s", species_tag, plant_codes_single)
+
   # Align coldata and txi to same samples in same order
   runs_single <- intersect(meta_single$run, colnames(txi_all$counts))
   meta_single <- meta_single[meta_single$run %in% runs_single, , drop = FALSE]
@@ -516,13 +595,10 @@ if (mode %in% c("single", "both")) {
   coldata_single$genotype  <- as.factor(coldata_single$genotype)
 
   # Build named colour vector for single-experiment genotypes
-  geno_levels_s <- levels(coldata_single$genotype)
-  n_geno_s      <- length(geno_levels_s)
-  if (!is.null(colours_multi) && length(colours_multi) >= n_geno_s) {
-    colours_single_named <- setNames(colours_multi[seq_len(n_geno_s)], geno_levels_s)
-  } else {
-    colours_single_named <- NULL
-  }
+  geno_levels_s        <- levels(coldata_single$genotype)
+  n_geno_s             <- length(geno_levels_s)
+  selected_s           <- select_colours(n_geno_s)
+  colours_single_named <- if (!is.null(selected_s)) setNames(selected_s, geno_levels_s) else NULL
 
   plots[["single"]] <- build_pca_plot(
     txi       = txi_single,
@@ -560,6 +636,61 @@ if (mode == "both") {
   ggsave(out_file, plot = plots[[mode]], width = 20, height = 18, units = "cm", dpi = 320, bg = "white")
   cat(sprintf("  Plot saved: %s\n", out_file))
 }
+
+# ============================================================
+# SUMMARY TABLES
+# ============================================================
+cat("\n[6] Generating summary tables...\n")
+
+# Table 1: filtering effect (genes and TEs before/after CV filter)
+all_ids_total  <- rownames(txi_all$counts)
+n_genes_total  <- sum(!startsWith(all_ids_total, "TE_"))
+n_te_total     <- sum(startsWith(all_ids_total, "TE_"))
+
+# Re-run filter to get post-filter counts (using meta_matched samples)
+dds_summary    <- DESeqDataSetFromTximport(
+  txi     = txi_all,
+  colData = meta_matched[, c("treatment", "genotype", "plant_code"), drop = FALSE],
+  design  = ~ treatment
+)
+dds_summary    <- estimateSizeFactors(dds_summary)
+filt_summary   <- filter_by_cv(counts(dds_summary), cv_threshold)
+kept_ids_summ  <- rownames(filt_summary)
+n_genes_kept   <- sum(!startsWith(kept_ids_summ, "TE_"))
+n_te_kept      <- sum(startsWith(kept_ids_summ, "TE_"))
+
+filter_table <- data.frame(
+  Feature   = c("Protein-coding genes", "Transposable elements (TEs)", "Total"),
+  Before_CV = c(n_genes_total, n_te_total, n_genes_total + n_te_total),
+  After_CV  = c(n_genes_kept,  n_te_kept,  n_genes_kept  + n_te_kept),
+  Retained_pct = round(100 * c(n_genes_kept, n_te_kept, n_genes_kept + n_te_kept) /
+                           c(n_genes_total, n_te_total, n_genes_total + n_te_total), 1)
+)
+colnames(filter_table)[4] <- "Retained (%)"
+
+out_filter <- file.path(output_dir, sprintf("summary_cv_filter_%s.tsv", species_tag))
+write.table(filter_table, file = out_filter, sep = "\t", quote = FALSE, row.names = FALSE)
+cat(sprintf("  Filtering summary saved: %s\n", out_filter))
+cat("\n  CV Filtering Effect:\n")
+print(filter_table, row.names = FALSE)
+
+# Table 2: species summary (genotypes, experiments, tissues)
+species_summary <- meta_matched %>%
+  summarise(
+    Species         = species_tag,
+    N_samples       = n(),
+    N_genotypes     = n_distinct(genotype),
+    N_experiments   = n_distinct(plant_code),
+    N_bioprojects   = n_distinct(bioproject),
+    Tissues         = paste(sort(unique(tissue)), collapse = ", "),
+    Treatments      = paste(sort(unique(as.character(treatment))), collapse = ", ")
+  )
+
+out_species <- file.path(output_dir, sprintf("summary_species_%s.tsv", species_tag))
+write.table(species_summary, file = out_species, sep = "\t", quote = FALSE, row.names = FALSE)
+cat(sprintf("\n  Species summary saved: %s\n", out_species))
+cat("\n  Species Summary:\n")
+print(as.data.frame(species_summary), row.names = FALSE)
 
 cat("\n================================================================\n")
 cat("DONE\n")
