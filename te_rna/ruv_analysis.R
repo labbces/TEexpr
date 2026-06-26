@@ -4,7 +4,9 @@
 # Panel: Raw PCA + k=1..5 (3x2 layout)
 # Outputs: corrected counts + VST + W factors for each k
 # ============================================================================
-# DEPENDENCIES
+# DEPENDENCIES:
+#   install.packages(c("ggplot2", "dplyr", "viridis", "patchwork", "ggrepel"))
+#   BiocManager::install(c("DESeq2", "tximport", "RUVSeq", "edgeR"))
 # ============================================================================
 
 library(ggplot2)
@@ -19,6 +21,8 @@ library(edgeR)
 
 # ============================================================================
 # COMMAND-LINE ARGUMENTS
+# Cluster: Rscript ruv_analysis.R --species Sbicolor --salmon_root /path ...
+# Interactive: fallback values in PARAMETERS section are used
 # ============================================================================
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -492,6 +496,10 @@ for (k in k_values) {
 cat("\n[9] Saving comparison panel...\n")
 
 k_plot_list <- lapply(k_values, function(k) pca_plots[[paste0("k", k)]])
+n_plots     <- 1 + length(k_values)  # Raw PCA + one per k
+n_cols      <- 3
+n_rows      <- ceiling(n_plots / n_cols)
+
 panel <- Reduce("+", c(list(raw_pca), k_plot_list)) +
   plot_annotation(
     title      = sprintf("%s — RUVr: Raw vs k=%s", species_tag, paste(k_values, collapse = ", ")),
@@ -502,10 +510,13 @@ panel <- Reduce("+", c(list(raw_pca), k_plot_list)) +
       plot.background = element_rect(fill = "white", colour = NA)
     )
   ) +
-  plot_layout(ncol = 3, nrow = 2)
+  plot_layout(ncol = n_cols, nrow = n_rows)
+
+panel_width  <- n_cols * 20
+panel_height <- n_rows * 18
 
 out_panel <- file.path(output_dir, sprintf("RUVr_panel_%s.png", species_tag))
-ggsave(out_panel, plot = panel, width = 60, height = 40, units = "cm",
+ggsave(out_panel, plot = panel, width = panel_width, height = panel_height, units = "cm",
        dpi = 320, bg = "white")
 cat(sprintf("  Panel saved: %s\n", out_panel))
 
