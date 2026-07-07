@@ -1,12 +1,7 @@
 # ============================================================================
 # RUV ANALYSIS — DROUGHT STRESS TRANSCRIPTOMICS
 # Method: RUVr (residuals)
-# Panel: Raw PCA + k=1..5 (3x2 layout)
 # Outputs: corrected counts + VST + W factors for each k
-# ============================================================================
-# DEPENDENCIES:
-#   install.packages(c("ggplot2", "dplyr", "viridis", "patchwork", "ggrepel"))
-#   BiocManager::install(c("DESeq2", "tximport", "RUVSeq", "edgeR"))
 # ============================================================================
 
 library(ggplot2)
@@ -53,7 +48,7 @@ runs_file     <- if (!is.null(cli_runs))     cli_runs     else NULL  # path to S
 # --- RUV settings ---
 # k_values: overridden via --k_values "6:11"
 k_values      <- if (!is.null(cli_k_values)) eval(parse(text = cli_k_values)) else 1:5
-cv_threshold      <- 0.15   # same CV filter as PCA
+cv_threshold      <- 0.5    # same CV filter as PCA
 pca_top_genes     <- 1000   # top variable genes for PCA plots
 n_negative_ctrl   <- 1000   # number of empirical negative controls for RUVg (lowest CV genes)
 
@@ -128,11 +123,11 @@ select_colours <- function(n, anchors = colours_anchors, palette = colours_multi
 build_tx2gene <- function(sf_files) {
   cat("  [tx2gene] Reading feature IDs from quant.sf...\n")
   sf_names <- read.table(sf_files[1], header = TRUE, sep = "\t")$Name
-
+  
   is_te    <- startsWith(sf_names, "TE_")
   gene_ids <- sf_names[!is_te]
   te_ids   <- sf_names[is_te]
-
+  
   # Remove isoform suffix — handles multiple patterns:
   #   Sobic.010G000100.1  -> Sobic.010G000100  (suffix: .N)
   #   Sof_g2.t1           -> Sof_g2            (suffix: .tN)
@@ -141,16 +136,16 @@ build_tx2gene <- function(sf_files) {
   gene_id_clean <- sub("\\.[Tt]\\d+$", "", gene_id_clean)
   gene_id_clean <- sub("\\.\\d+$",     "", gene_id_clean)
   gene_id_clean <- sub("_[Tt]\\d+$",  "", gene_id_clean)
-
+  
   gene_rows <- data.frame(
     tx_id   = gene_ids,
     gene_id = gene_id_clean,
     stringsAsFactors = FALSE
   ) %>% distinct()
-
+  
   cat(sprintf("  [tx2gene] Genes: %d transcripts -> %d unique genes\n",
               nrow(gene_rows), length(unique(gene_rows$gene_id))))
-
+  
   if (length(te_ids) == 0) {
     cat("  [tx2gene] No TE IDs found -- skipping TE mapping\n")
     te_rows <- data.frame(tx_id = character(0), gene_id = character(0),
@@ -164,7 +159,7 @@ build_tx2gene <- function(sf_files) {
     cat(sprintf("  [tx2gene] TEs: %d instances -> %d representative elements\n",
                 nrow(te_rows), length(unique(te_rows$gene_id))))
   }
-
+  
   tx2gene <- bind_rows(gene_rows, te_rows)
   cat(sprintf("  [tx2gene] Total: %d entries (%d gene transcripts + %d TE instances)\n",
               nrow(tx2gene), nrow(gene_rows), nrow(te_rows)))
@@ -175,13 +170,13 @@ build_tx2gene <- function(sf_files) {
 find_sf_files <- function(salmon_root, species_tag) {
   species_dirs <- list.dirs(salmon_root, recursive = FALSE, full.names = TRUE)
   species_dirs <- species_dirs[startsWith(basename(species_dirs), species_tag)]
-
+  
   if (length(species_dirs) == 0)
     stop(sprintf("No directories starting with '%s' found under:\n  %s", species_tag, salmon_root))
-
+  
   cat(sprintf("  Found %d species director%s matching '%s'\n",
               length(species_dirs), ifelse(length(species_dirs) == 1, "y", "ies"), species_tag))
-
+  
   all_sf <- c()
   for (sp_dir in species_dirs) {
     # Support both structures:
@@ -198,10 +193,10 @@ find_sf_files <- function(salmon_root, species_tag) {
     found       <- sf_paths[file.exists(sf_paths)]
     all_sf      <- c(all_sf, found)
   }
-
+  
   if (length(all_sf) == 0)
     stop("No quant.sf files found. Check salmon_root and species_tag.")
-
+  
   names(all_sf) <- basename(dirname(all_sf))
   cat(sprintf("  Found %d quant.sf files\n", length(all_sf)))
   all_sf
@@ -210,23 +205,23 @@ find_sf_files <- function(salmon_root, species_tag) {
 
 load_metadata <- function(metadata_file, merge_rehydration) {
   meta <- read.table(metadata_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
-
+  
   required_cols <- c("plant_code", "genotype", "run", "bioproject", "treatment")
   missing_cols  <- setdiff(required_cols, colnames(meta))
   if (length(missing_cols) > 0)
     stop(sprintf("Metadata missing columns: %s", paste(missing_cols, collapse = ", ")))
-
+  
   meta$treatment <- tolower(trimws(meta$treatment))
-
+  
   if (merge_rehydration) {
     n_rehy <- sum(meta$treatment %in% c("rehydration", "rehydrated", "rehidratacao", "rehidratación"))
     if (n_rehy > 0) {
       cat(sprintf("  Merging %d rehydration samples -> 'drought'\n", n_rehy))
       meta$treatment[meta$treatment %in% c("rehydration", "rehydrated",
-                                            "rehidratacao", "rehidratación")] <- "drought"
+                                           "rehidratacao", "rehidratación")] <- "drought"
     }
   }
-
+  
   meta$treatment <- factor(meta$treatment,
                            levels = c("control", "drought"),
                            labels = c("Control", "Drought"))
@@ -250,44 +245,44 @@ build_pca_plot <- function(vst_obj, coldata, title = "") {
   color_col <- "genotype"
   shape_col <- "treatment"
   label_col <- "plant_code"
-
+  
   intgroup  <- unique(c(color_col, shape_col, label_col))
   intgroup  <- intgroup[!is.na(intgroup) & intgroup %in% colnames(colData(vst_obj))]
   pca_data  <- plotPCA(vst_obj, intgroup = intgroup,
                        returnData = TRUE, ntop = pca_top_genes)
   pct_var   <- round(100 * attr(pca_data, "percentVar"))
-
+  
   # Build gene/TE count subtitle
   feat_ids     <- rownames(assay(vst_obj))
   n_genes_plot <- sum(!startsWith(feat_ids, "TE_"))
   n_te_plot    <- sum(startsWith(feat_ids, "TE_"))
   subtitle     <- sprintf("Genes: %d | TEs: %d (CV >= %.0f%%)",
-                           n_genes_plot, n_te_plot, cv_threshold * 100)
-
+                          n_genes_plot, n_te_plot, cv_threshold * 100)
+  
   pca_data[[shape_col]] <- as.factor(pca_data[[shape_col]])
   pca_data[[color_col]] <- as.factor(pca_data[[color_col]])
-
+  
   n_geno <- nlevels(pca_data[[color_col]])
-
+  
   p <- ggplot(pca_data, aes(x = PC1, y = PC2,
-                             colour = .data[[color_col]],
-                             shape  = .data[[shape_col]])) +
+                            colour = .data[[color_col]],
+                            shape  = .data[[shape_col]])) +
     geom_point(size = 4, alpha = 0.85, stroke = 0.5) +
     ggrepel::geom_text_repel(aes(label = .data[[label_col]]),
-                              size = 3, max.overlaps = 20,
-                              box.padding = 0.4, show.legend = FALSE) +
+                             size = 3, max.overlaps = 20,
+                             box.padding = 0.4, show.legend = FALSE) +
     xlab(paste0("PC1: ", pct_var[1], "% variância")) +
     ylab(paste0("PC2: ", pct_var[2], "% variância")) +
     ggtitle(title) +
     labs(subtitle = subtitle) +
     { n_col   <- nlevels(as.factor(pca_data[[color_col]]))
-      sel_col <- select_colours(n_col)
-      if (!is.null(sel_col))
-        scale_colour_manual(
-          values = setNames(sel_col, levels(as.factor(pca_data[[color_col]]))),
-          name   = legend_genotype)
-      else
-        scale_colour_viridis_d(option = "D", name = legend_genotype) } +
+    sel_col <- select_colours(n_col)
+    if (!is.null(sel_col))
+      scale_colour_manual(
+        values = setNames(sel_col, levels(as.factor(pca_data[[color_col]]))),
+        name   = legend_genotype)
+    else
+      scale_colour_viridis_d(option = "D", name = legend_genotype) } +
     scale_shape_manual(values  = shapes_treatment,
                        labels  = labels_treatment,
                        name    = legend_treatment) +
@@ -354,19 +349,19 @@ if (any(na_treat)) {
 if (!is.null(runs_file)) {
   if (!file.exists(runs_file))
     stop(sprintf("runs_file not found: %s", runs_file))
-
+  
   whitelist   <- trimws(readLines(runs_file))
   whitelist   <- whitelist[nchar(whitelist) > 0]
   runs_found  <- intersect(whitelist, rownames(meta_matched))
   runs_miss   <- setdiff(whitelist, rownames(meta_matched))
-
+  
   cat(sprintf("  Whitelist: %d requested | %d found | %d missing\n",
               length(whitelist), length(runs_found), length(runs_miss)))
   if (length(runs_miss) > 0)
     cat(sprintf("  Missing: %s\n", paste(runs_miss, collapse = ", ")))
   if (length(runs_found) == 0)
     stop("None of the whitelisted SRRs found in data.")
-
+  
   meta_matched <- meta_matched[runs_found, , drop = FALSE]
   meta_matched <- meta_matched[order(match(meta_matched$run, names(sf_matched))), ]
   sf_matched   <- sf_matched[meta_matched$run]
@@ -407,10 +402,12 @@ dds_raw <- DESeqDataSetFromTximport(
 # Filter: keep only expressed genes
 keep <- rowSums(counts(dds_raw)) > 0
 dds_raw <- dds_raw[keep, ]
+head(as.data.frame(assays(dds_raw)))
 cat(sprintf("  After expression filter: %d genes retained\n", sum(keep)))
 
 # CV filter
-raw_filtered <- filter_by_cv(counts(dds_raw), cv_threshold)
+dds_raw_pre  <- estimateSizeFactors(dds_raw) #remove sequencing effort effect
+raw_filtered <- filter_by_cv(counts(dds_raw_pre), cv_threshold)
 dds_raw      <- dds_raw[rownames(raw_filtered), ]
 
 # --- 7. Raw PCA (before correction — control panel) ---
@@ -449,15 +446,15 @@ cat(sprintf("  Genes after edgeR filter: %d\n", nrow(y$counts)))
 
 
 # --- 9. RUVr for each k ---
-cat("\n[8] Running RUVr k=1 to 5...\n")
+cat("\n[8] Running RUVr")
 
 pca_plots <- list()
 
 for (k in k_values) {
   cat(sprintf("\n  --- k = %d ---\n", k))
-
+  
   ruv     <- RUVr(y$counts, rownames(y), k = k, res)
-
+  
   dds_ruv <- DESeqDataSetFromMatrix(
     countData = ruv$normalizedCounts,
     colData   = coldata,
@@ -466,28 +463,28 @@ for (k in k_values) {
   vst_ruv <- varianceStabilizingTransformation(dds_ruv, blind = TRUE)
   colData(vst_ruv)$genotype   <- coldata$genotype
   colData(vst_ruv)$plant_code <- coldata$plant_code
-
+  
   pca_plots[[paste0("k", k)]] <- build_pca_plot(
     vst_obj = vst_ruv,
     coldata = coldata,
     title   = sprintf("%s — RUVr k=%d", species_tag, k)
   )
-
+  
   # Save outputs
   write.table(ruv$normalizedCounts,
               file = file.path(output_dir, sprintf("RUVr_k%d_%s_corrected_counts.tsv", k, species_tag)),
               sep = "\t", quote = FALSE, col.names = TRUE)
-
+  
   write.table(assay(vst_ruv),
               file = file.path(output_dir, sprintf("RUVr_k%d_%s_vst.tsv", k, species_tag)),
               sep = "\t", quote = FALSE, col.names = TRUE)
-
+  
   w_df     <- as.data.frame(ruv$W)
   w_df$run <- rownames(w_df)
   write.table(w_df,
               file = file.path(output_dir, sprintf("RUVr_k%d_%s_W_factors.tsv", k, species_tag)),
               sep = "\t", quote = FALSE, row.names = FALSE)
-
+  
   cat(sprintf("  RUVr k=%d outputs saved\n", k))
 }
 
@@ -528,17 +525,20 @@ cat("\n[10] Generating summary tables...\n")
 
 # Table 1: filtering effect
 all_ids_total <- rownames(y$counts)
-n_genes_total <- sum(!startsWith(rownames(counts(dds_raw)), "TE_"))
-n_te_total    <- sum(startsWith(rownames(counts(dds_raw)), "TE_"))
+n_genes_total <- sum(!startsWith(rownames(txi$counts), "TE_"))
+n_te_total    <- sum(startsWith(rownames(txi$counts), "TE_"))
+n_genes_cv    <- sum(!startsWith(rownames(counts(dds_raw)), "TE_"))
+n_te_cv       <- sum(startsWith(rownames(counts(dds_raw)), "TE_"))
 n_genes_kept  <- sum(!startsWith(all_ids_total, "TE_"))
 n_te_kept     <- sum(startsWith(all_ids_total, "TE_"))
 
 filter_table <- data.frame(
   Feature      = c("Protein-coding genes", "Transposable elements (TEs)", "Total"),
   Before_CV    = c(n_genes_total, n_te_total, n_genes_total + n_te_total),
-  After_CV     = c(n_genes_kept,  n_te_kept,  n_genes_kept  + n_te_kept),
+  After_CV     = c(n_genes_cv,  n_te_cv,  n_genes_cv  + n_te_cv),
+  After_filteredByExpression = c(n_genes_kept,  n_te_kept,  n_genes_kept  + n_te_kept),
   Retained_pct = round(100 * c(n_genes_kept, n_te_kept, n_genes_kept + n_te_kept) /
-                            c(n_genes_total, n_te_total, n_genes_total + n_te_total), 1)
+                         c(n_genes_total, n_te_total, n_genes_total + n_te_total), 1)
 )
 colnames(filter_table)[4] <- "Retained (%)"
 
