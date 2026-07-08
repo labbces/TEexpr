@@ -533,16 +533,16 @@ n_genes_kept  <- sum(!startsWith(all_ids_total, "TE_"))
 n_te_kept     <- sum(startsWith(all_ids_total, "TE_"))
 
 filter_table <- data.frame(
-  Feature      = c("Protein-coding genes", "Transposable elements (TEs)", "Total"),
-  Before_CV    = c(n_genes_total, n_te_total, n_genes_total + n_te_total),
-  After_CV     = c(n_genes_cv,  n_te_cv,  n_genes_cv  + n_te_cv),
+  Feature                    = c("Protein-coding genes", "Transposable elements (TEs)", "Total"),
+  Before_CV                  = c(n_genes_total, n_te_total, n_genes_total + n_te_total),
+  After_CV                   = c(n_genes_cv,  n_te_cv,  n_genes_cv  + n_te_cv),
   After_filteredByExpression = c(n_genes_kept,  n_te_kept,  n_genes_kept  + n_te_kept),
-  Retained_pct = round(100 * c(n_genes_kept, n_te_kept, n_genes_kept + n_te_kept) /
-                         c(n_genes_total, n_te_total, n_genes_total + n_te_total), 1)
+  `Retained (%)`             = round(100 * c(n_genes_kept, n_te_kept, n_genes_kept + n_te_kept) /
+                               c(n_genes_total, n_te_total, n_genes_total + n_te_total), 1),
+  check.names = FALSE
 )
-colnames(filter_table)[4] <- "Retained (%)"
 
-out_filter <- file.path(output_dir, sprintf("summary_cv_filter_%s.tsv", species_tag))
+out_filter <- file.path(output_dir, sprintf("summary_filter_%s.tsv", species_tag))
 write.table(filter_table, file = out_filter, sep = "\t", quote = FALSE, row.names = FALSE)
 cat(sprintf("  Filtering summary saved: %s\n", out_filter))
 cat("\n  CV Filtering Effect:\n")
