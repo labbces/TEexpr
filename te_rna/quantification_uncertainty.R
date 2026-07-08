@@ -51,6 +51,13 @@ library(SummarizedExperiment)
 library(dplyr)
 library(matrixStats)
 
+# Prevent vroom/readr from spawning multiple threads.
+# EAGAIN ("Resource temporarily unavailable") occurs when the system is near
+# its thread or file-descriptor limit and a pthread_create() call fails.
+# readr >= 2.x uses vroom internally; both the R option AND the environment
+# variable must be set because they are independent controls.
+options(readr.num_threads = 1)
+Sys.setenv(VROOM_THREADS = "1")
 
 # ------------------------------------------------------------------------------
 # 1. User-defined parameters
@@ -94,7 +101,6 @@ if (!dir.exists(SALMON_DIR)) stop("Salmon directory not found: ", SALMON_DIR)
 
 dir.create(file.path(OUT_DIR, "tables"), recursive = TRUE, showWarnings = FALSE)
 
-
 # ------------------------------------------------------------------------------
 # 3. Load conditions file
 # ------------------------------------------------------------------------------
@@ -118,10 +124,20 @@ cat("Conditions file loaded\n")
 cat("  Samples:    ", nrow(conditions), "\n")
 cat("  Conditions: ", paste(unique(conditions$condition), collapse = ", "), "\n\n")
 
-# Normalise condition labels to lowercase to avoid silent mismatches caused
-# by capitalisation differences (e.g. "Control" vs "control")
-conditions$condition <- tolower(conditions$condition)
-CONDITION_ORDER      <- tolower(CONDITION_ORDER)
+# Normalise condition labels: trim whitespace then lowercase.
+# Rows with empty condition values (after trimming) are dropped with a warning
+# because they cannot be mapped to any condition and would silently propagate
+# as "" keys throughout the pipeline, causing NULL lookups later.
+conditions$condition <- tolower(trimws(conditions$condition))
+CONDITION_ORDER      <- tolower(trimws(CONDITION_ORDER))
+
+empty_rows <- nchar(conditions$condition) == 0 | is.na(conditions$condition)
+if (any(empty_rows)) {
+  warning(sum(empty_rows), " row(s) in CONDITIONS_FILE have an empty condition ",
+          "value and will be ignored: ",
+          paste(conditions$sample[empty_rows], collapse = ", "))
+  conditions <- conditions[!empty_rows, ]
+}
 
 cat("  Conditions (normalised): ",
     paste(unique(conditions$condition), collapse = ", "), "\n\n")
@@ -151,83 +167,150 @@ files <- setNames(conditions$files, conditions$sample)
 
 
 # ------------------------------------------------------------------------------
-# 5. Import Salmon output with tximport
+# 5. Probe first sample — get feature IDs only (no infReps loaded)
 # ------------------------------------------------------------------------------
+# Gibbs replicate matrices can exceed 1 GB per sample, making it impossible to
+# load them via tximport even one sample at a time.  Instead we:
+#   (a) Load counts/TPM only (dropInfReps=TRUE) to get feature IDs.
+#   (b) Verify that the binary bootstraps.gz file exists for the first sample.
+#   (c) Read Gibbs replicates directly in the per-sample loop (section 8),
+#       one replicate at a time using readBin, accumulating running statistics.
 
-cat("Importing Salmon data (this may take several minutes)...\n")
-
-txi <- tximport(
-  files,
-  type        = "salmon",
-  txOut       = TRUE,
-  dropInfReps = FALSE
+cat("Probing first sample (feature IDs only, no infReps)...\n")
+cat("  Reading: ", files[1], "\n", sep = "")
+txi_first <- tryCatch(
+  tximport(files[1], type = "salmon", txOut = TRUE, dropInfReps = TRUE),
+  error = function(e) {
+    cat("\n  ERROR: Failed to read first sample!\n")
+    cat("    File:  ", files[1], "\n", sep = "")
+    cat("    Reason: ", conditionMessage(e), "\n\n", sep = "")
+    cat("  Checking file validity...\n")
+    cat("    File exists:  ", file.exists(files[1]), "\n", sep = "")
+    cat("    File size:    ", file.size(files[1]), " bytes\n", sep = "")
+    cat("    First 500 chars:\n")
+    try({
+      con <- file(files[1], "r")
+      lines <- readLines(con, n = 5)
+      close(con)
+      cat(paste("      ", lines), sep = "\n")
+    }, silent = TRUE)
+    stop("Cannot proceed without a valid first sample.")
+  }
 )
 
-n_gibbs <- ncol(txi$infReps[[1]])
+all_ids_first <- rownames(txi_first$counts)
+n_all_first   <- length(all_ids_first)
+rm(txi_first); gc()
 
-cat("  Features imported:     ", nrow(txi$counts), "\n")
-cat("  Samples detected:      ", ncol(txi$counts), "\n")
-cat("  Gibbs replicates / feature: ", n_gibbs, "\n\n")
-
-if (n_gibbs == 0) {
-  stop("No Gibbs replicates found. ",
-       "Re-run Salmon with --numGibbsSamples <N>.")
+# Locate the Salmon Gibbs binary file.  tximport stores both bootstrap and
+# Gibbs samples at aux_info/bootstrap/bootstraps.gz regardless of samp_type.
+boot_path_1 <- file.path(dirname(files[1]), "aux_info", "bootstrap", "bootstraps.gz")
+if (!file.exists(boot_path_1)) {
+  stop("Gibbs/bootstrap binary not found: ", boot_path_1,
+       "\n  Re-run Salmon with --numGibbsSamples <N>.")
 }
 
-
-# ------------------------------------------------------------------------------
-# 6. Build SummarizedExperiment
-# ------------------------------------------------------------------------------
-# tximport returns txi$infReps as a list of matrices (one per sample), each of
-# dimension n_features × n_Gibbs.  We transpose the indexing so that each assay
-# 'infRepK' is an n_features × n_samples matrix, consistent with tximport
-# convention and required by fishpond::scaleInfReps().
-#
-# Resulting assays:
-#   counts     -- read counts             [n_features × n_samples]
-#   abundance  -- TPM values              [n_features × n_samples]
-#   length     -- effective lengths       [n_features × n_samples]
-#   infRep1 .. infRep<n_gibbs>            [n_features × n_samples]
-
-cat("Restructuring inferential replicates for SummarizedExperiment...\n")
-
-inf_assays <- setNames(
-  lapply(seq_len(n_gibbs), function(k) {
-    mat <- do.call(cbind, lapply(txi$infReps, function(s_mat) {
-      s_mat[, k, drop = FALSE]
-    }))
-    colnames(mat) <- conditions$sample
-    mat
-  }),
-  paste0("infRep", seq_len(n_gibbs))
+# Read replicate count from meta_info.json (tiny JSON, no memory impact)
+minfo_1 <- jsonlite::fromJSON(
+  file.path(dirname(files[1]), "aux_info", "meta_info.json")
 )
+n_gibbs <- minfo_1$num_bootstraps   # Salmon uses this field for both Gibbs and bootstrap
+rm(minfo_1)
 
-se <- SummarizedExperiment(
-  assays  = c(
-    list(
-      counts    = txi$counts,
-      abundance = txi$abundance,
-      length    = txi$length
-    ),
-    inf_assays
-  ),
-  colData = DataFrame(
-    condition = factor(conditions$condition,
-                       levels = ordered_conditions),
-    row.names = conditions$sample
-  )
-)
+cat("  Features in first sample: ", n_all_first, "\n")
+cat("  Gibbs replicates:         ", n_gibbs,      "\n")
+cat("  bootstraps.gz confirmed:  ", boot_path_1, "\n\n")
 
-# Scale inferential replicates to correct for differences in sequencing depth
-se <- scaleInfReps(se)
-
-samples           <- colnames(se)
+# Metadata — derived from the conditions table (no SE needed)
+samples           <- conditions$sample
 n_samples         <- length(samples)
-conditions_vector <- as.character(colData(se)$condition)
+conditions_vector <- conditions$condition   # already tolower/trimws from section 3
 
-cat("  SummarizedExperiment built and replicates scaled\n")
-cat("  Dimensions: ", nrow(se), " features × ", n_samples, " samples\n\n",
-    sep = "")
+
+# ------------------------------------------------------------------------------
+# 6. Compute size factors (counts only, one sample at a time)
+# ------------------------------------------------------------------------------
+# Peak memory per iteration: one tximport object (~2 MB for a single quant.sf
+# without infReps) + growing log_count_sum vector (n_features × 8 bytes).
+# The count vectors for all samples are kept in a list (~n_features × n_samples
+# × 8 bytes total) so each sample's size factor can be computed without a
+# second file-read pass.
+
+cat("Computing size factors (two-pass algorithm to minimize memory)...\n")
+cat("  Pass 1: Accumulate log-counts to compute geometric means\n\n")
+
+log_count_sum <- numeric(n_all_first)
+samples_ok    <- logical(n_samples)
+
+# PASS 1: Accumulate sums for geometric mean computation
+for (s in seq_len(n_samples)) {
+  qt <- tryCatch({
+    read.table(files[s], header = TRUE, sep = "\t", nrows = n_all_first,
+               colClasses = c("character", rep("numeric", 4)))
+  }, error = function(e) {
+    warning("Failed to read count data from ", files[s], ": ",
+            conditionMessage(e))
+    NULL
+  })
+
+  if (is.null(qt)) {
+    samples_ok[s] <- FALSE
+    next
+  }
+
+  if (!("NumReads" %in% colnames(qt))) {
+    warning("NumReads column not found in ", files[s])
+    samples_ok[s] <- FALSE
+    next
+  }
+
+  samples_ok[s] <- TRUE
+  cv            <- qt$NumReads
+  rm(qt); gc()
+  log_count_sum <- log_count_sum + log(cv + 0.5)
+}
+
+n_samples_ok <- sum(samples_ok)
+cat("  Valid samples: ", n_samples_ok, " / ", n_samples, "\n", sep = "")
+
+if (n_samples_ok < 2) {
+  stop("Fewer than 2 valid samples; cannot compute size factors.")
+}
+
+geom_means_log <- log_count_sum / n_samples_ok
+rm(log_count_sum); gc()
+
+# PASS 2: Compute individual size factors without storing all counts
+cat("  Pass 2: Compute size factors per sample\n\n")
+
+size_factors <- numeric(n_samples)
+
+for (s in seq_len(n_samples)) {
+  if (!samples_ok[s]) {
+    size_factors[s] <- NA_real_
+    next
+  }
+
+  qt <- tryCatch({
+    read.table(files[s], header = TRUE, sep = "\t", nrows = n_all_first,
+               colClasses = c("character", rep("numeric", 4)))
+  }, error = function(e) NULL)
+
+  if (is.null(qt) || !("NumReads" %in% colnames(qt))) {
+    size_factors[s] <- NA_real_
+    next
+  }
+
+  cv <- qt$NumReads
+  rm(qt); gc()
+  size_factors[s] <- median(exp(log(cv + 0.5) - geom_means_log), na.rm = TRUE)
+}
+names(size_factors) <- samples
+rm(geom_means_log); gc()
+
+cat("  Size factors range: [",
+    round(min(size_factors, na.rm = TRUE), 3), ", ",
+    round(max(size_factors, na.rm = TRUE), 3), "]\n\n", sep = "")
 
 
 # ------------------------------------------------------------------------------
@@ -256,7 +339,7 @@ te_class_ref <- read.table(
 
 cat("Classification file loaded: ", nrow(te_class_ref), " entries\n\n", sep = "")
 
-all_ids   <- rownames(se)
+all_ids   <- all_ids_first
 n_all     <- length(all_ids)
 is_te     <- grepl("^TE_", all_ids)
 te_ids    <- all_ids[is_te]
@@ -312,7 +395,7 @@ feature_class <- data.frame(
 # 8. Compute per-sample uncertainty metrics (all features)
 # ------------------------------------------------------------------------------
 # For each feature × sample, five metrics summarise variation across the
-# n_gibbs Gibbs replicates.
+# Gibbs replicates (count per sample determined during streaming, see n_gibbs).
 #
 # CV  (Coefficient of Variation) = SD / mean
 #   Relative uncertainty; enables comparison across expression levels.
@@ -347,66 +430,186 @@ feature_class <- data.frame(
 #   Note: InfRV is computed by fishpond before the pseudo-count is applied,
 #   using its own internal stabilisation.
 
-cat("Computing uncertainty metrics for all features...\n")
+cat("Computing uncertainty metrics for all features (one sample at a time)...\n")
+cat("  Memory strategy: running condition sums instead of",
+    "full n_features × n_samples matrices\n\n")
 
-# --- InfRV via fishpond -------------------------------------------------------
-# computeInfRV() adds "mean" and "variance" assays to se (averaged across
-# Gibbs replicates per feature per sample) and stores InfRV in rowData(se).
-# We compute the InfRV matrix directly from those two assays using the
-# canonical formula: InfRV = max(variance / mean² - 1/mean, 0)
-# This is equivalent to what fishpond computes internally and avoids any
-# version-dependent naming of the output assay.
-se <- computeInfRV(se)
+feat_names  <- all_ids
+n_cond      <- length(ordered_conditions)
 
-infrv_mean <- assay(se, "mean")
-infrv_var  <- assay(se, "variance")
-mat_infrv  <- pmax(infrv_var / infrv_mean^2 - 1 / infrv_mean, 0)
-mat_infrv[!is.finite(mat_infrv)] <- NA
+# Map each sample to its condition index for O(1) lookup in the loop
+sample_cond <- match(conditions_vector, ordered_conditions)
 
-rep_names  <- paste0("infRep", seq_len(n_gibbs))
-feat_names <- all_ids
+# Allocate sum and non-NA-count matrices: n_all × n_cond.
+# Peak memory ≈ n_all × n_cond × 8 bytes per matrix — independent of n_samples.
+mk_sum <- function() matrix(0,  nrow = n_all, ncol = n_cond,
+                             dimnames = list(feat_names, ordered_conditions))
+mk_cnt <- function() matrix(0L, nrow = n_all, ncol = n_cond,
+                             dimnames = list(feat_names, ordered_conditions))
 
-mat_cv   <- matrix(NA, nrow = n_all, ncol = n_samples,
-                   dimnames = list(feat_names, samples))
-mat_sd   <- mat_cv
-mat_iqr  <- mat_cv
-mat_phi  <- mat_cv
-mat_mean <- mat_cv
+tpm_s <- mk_sum(); tpm_n <- mk_cnt()
+cv_s  <- mk_sum(); cv_n  <- mk_cnt()
+sd_s  <- mk_sum(); sd_n  <- mk_cnt()
+iqr_s <- mk_sum(); iqr_n <- mk_cnt()
+phi_s <- mk_sum(); phi_n <- mk_cnt()
+inf_s <- mk_sum(); inf_n <- mk_cnt()
+
+# Global running sums across ALL samples (used for per-feature mean CV ranking
+# and the run-level summary).  Vectors of length n_all.
+cv_g_s  <- numeric(n_all)
+cv_g_n  <- integer(n_all)
+phi_g_s <- numeric(n_all)
+inf_g_s <- numeric(n_all)
 
 for (s in seq_len(n_samples)) {
-  cat("  Sample ", s, "/", n_samples, ": ", samples[s], "\n", sep = "")
-  rep_mat   <- sapply(rep_names, function(r) assay(se, r)[, s]) + PSEUDOCOUNT
-  mean_vals <- rowMeans(rep_mat, na.rm = TRUE)
-  var_vals  <- matrixStats::rowVars(rep_mat, na.rm = TRUE)
-  sd_vals   <- sqrt(var_vals)
-  iqr_vals  <- matrixStats::rowIQRs(rep_mat, na.rm = TRUE)
-  
-  mat_mean[, s] <- mean_vals
-  mat_cv[, s]   <- sd_vals / mean_vals
-  mat_sd[, s]   <- sd_vals
-  mat_iqr[, s]  <- iqr_vals
-  mat_phi[, s]  <- var_vals / mean_vals
+  # Skip if this sample failed size factor computation
+  if (!samples_ok[s]) {
+    cat("  Sample ", s, "/", n_samples, ": ", samples[s],
+        " [SKIPPED — invalid size factors]\n", sep = "")
+    next
+  }
+
+  ci <- sample_cond[s]
+  cat("  Sample ", s, "/", n_samples,
+      " [", ordered_conditions[ci], "]: ", samples[s], "\n", sep = "")
+
+  # ── TPM (reads directly from quant.sf, avoiding tximport overhead) ──────────
+  qt <- tryCatch({
+    read.table(files[s], header = TRUE, sep = "\t", nrows = n_all_first,
+               colClasses = c("character", rep("numeric", 4)))
+  }, error = function(e) {
+    warning("Failed to read TPM from ", files[s], ": ", conditionMessage(e))
+    NULL
+  })
+
+  if (is.null(qt) || !("TPM" %in% colnames(qt))) {
+    warning("  Sample ", samples[s], " will be skipped entirely (missing TPM).")
+    next
+  }
+
+  tpm_v <- qt$TPM
+  rm(qt); gc()
+
+  ok    <- !is.na(tpm_v)
+  tpm_s[ok, ci] <- tpm_s[ok, ci] + tpm_v[ok]
+  tpm_n[ok, ci] <- tpm_n[ok, ci] + 1L
+  rm(tpm_v)
+
+  # ── Gibbs replicates: stream one replicate at a time from binary file ──────
+  # Salmon stores all replicates in aux_info/bootstrap/bootstraps.gz as a flat
+  # sequence of float64 values written column-major: first n_features values =
+  # replicate 1, next n_features values = replicate 2, etc.
+  # Reading n_features doubles repeatedly with readBin streams exactly one
+  # replicate per call, keeping peak memory at ~4 × n_features × 8 bytes.
+  boot_path <- file.path(dirname(files[s]), "aux_info", "bootstrap",
+                         "bootstraps.gz")
+
+  if (!file.exists(boot_path)) {
+    warning("No bootstraps.gz for sample ", samples[s], "; skipping metrics.")
+    next
+  }
+
+  sf_inv   <- 1 / size_factors[s]
+  sum_raw  <- numeric(n_all)   # scaled values — used for InfRV
+  sum_raw2 <- numeric(n_all)
+  sum_pc   <- numeric(n_all)   # scaled + pseudocount — used for CV/SD/phi
+  sum_pc2  <- numeric(n_all)
+  n_reps   <- 0L
+
+  boot_con <- NULL
+  tryCatch({
+    boot_con <- gzcon(file(boot_path, "rb"))
+    repeat {
+      vals <- readBin(boot_con, what = "double", n = n_all, size = 8L,
+                      endian = "little")
+      if (length(vals) == 0L) break
+      if (length(vals) != n_all) {
+        warning("Partial replicate at end of ", boot_path, "; discarded.")
+        break
+      }
+      vals_sc  <- vals * sf_inv
+      vals_pc  <- vals_sc + PSEUDOCOUNT
+      sum_raw  <- sum_raw  + vals_sc
+      sum_raw2 <- sum_raw2 + vals_sc  * vals_sc
+      sum_pc   <- sum_pc   + vals_pc
+      sum_pc2  <- sum_pc2  + vals_pc  * vals_pc
+      n_reps   <- n_reps   + 1L
+    }
+  }, error = function(e) {
+    warning("Error reading bootstraps.gz for sample ", samples[s],
+            "\n  Error: ", conditionMessage(e))
+  }, finally = {
+    if (!is.null(boot_con)) close(boot_con)
+  })
+
+  if (n_reps < 2L) {
+    warning("Fewer than 2 replicates for sample ", samples[s],
+            "; uncertainty metrics skipped.")
+    next
+  }
+
+  # ── Compute metrics from running sums (Bessel-corrected variance) ──────────
+  mu_raw  <- sum_raw / n_reps
+  mu_pc   <- sum_pc  / n_reps
+  var_raw <- pmax((sum_raw2 - n_reps * mu_raw^2) / (n_reps - 1L), 0)
+  var_pc  <- pmax((sum_pc2  - n_reps * mu_pc^2)  / (n_reps - 1L), 0)
+  rm(sum_raw, sum_raw2, sum_pc, sum_pc2)
+
+  sd_v  <- sqrt(var_pc)
+  cv_v  <- sd_v  / mu_pc
+  iqr_v <- 1.35 * sd_v   # normal-distribution approximation: IQR ≈ 1.35 SD
+  phi_v <- var_pc / mu_pc
+
+  infrv <- pmax(var_raw / mu_raw^2 - 1 / mu_raw, 0)
+  infrv[!is.finite(infrv)] <- NA
+  rm(var_raw, var_pc, mu_raw, mu_pc); gc()
+
+  ok_i  <- !is.na(infrv)
+  inf_s[ok_i, ci] <- inf_s[ok_i, ci] + infrv[ok_i]
+  inf_n[ok_i, ci] <- inf_n[ok_i, ci] + 1L
+  inf_g_s         <- inf_g_s + ifelse(ok_i, infrv, 0)
+
+  ok_cv <- !is.na(cv_v)
+  cv_s[ok_cv, ci] <- cv_s[ok_cv, ci] + cv_v[ok_cv]
+  cv_n[ok_cv, ci] <- cv_n[ok_cv, ci] + 1L
+  cv_g_s[ok_cv]   <- cv_g_s[ok_cv] + cv_v[ok_cv]
+  cv_g_n[ok_cv]   <- cv_g_n[ok_cv] + 1L
+
+  ok_sd <- !is.na(sd_v)
+  sd_s[ok_sd, ci] <- sd_s[ok_sd, ci] + sd_v[ok_sd]
+  sd_n[ok_sd, ci] <- sd_n[ok_sd, ci] + 1L
+
+  ok_iq <- !is.na(iqr_v)
+  iqr_s[ok_iq, ci] <- iqr_s[ok_iq, ci] + iqr_v[ok_iq]
+  iqr_n[ok_iq, ci] <- iqr_n[ok_iq, ci] + 1L
+
+  ok_ph <- !is.na(phi_v)
+  phi_s[ok_ph, ci] <- phi_s[ok_ph, ci] + phi_v[ok_ph]
+  phi_n[ok_ph, ci] <- phi_n[ok_ph, ci] + 1L
+  phi_g_s          <- phi_g_s + ifelse(ok_ph, phi_v, 0)
 }
 
+gc()
 cat("\nMetrics computed\n\n")
 
 
 # ------------------------------------------------------------------------------
 # 9. Sanitise feature ID names
 # ------------------------------------------------------------------------------
-# Some TE IDs contain "|" (e.g. "TE_001|Chr01:100-200|+"), which can disrupt
-# data.frame construction.  We retain only the portion before the first "|".
-# Gene IDs typically do not contain "|", so this step is safe for all features.
+# Some TE IDs contain "|" (e.g. "TE_001|Chr01:100-200|+").
+# Retain only the portion before the first "|".
 
-clean_feat_names <- sub("\\|.*", "", rownames(mat_cv))
+clean_feat_names <- sub("\\|.*", "", feat_names)
 
-rownames(mat_cv)    <- clean_feat_names
-rownames(mat_sd)    <- clean_feat_names
-rownames(mat_iqr)   <- clean_feat_names
-rownames(mat_phi)   <- clean_feat_names
-rownames(mat_mean)  <- clean_feat_names
-rownames(mat_infrv) <- clean_feat_names
-feat_names          <- clean_feat_names
+rownames(tpm_s) <- rownames(tpm_n) <- clean_feat_names
+rownames(cv_s)  <- rownames(cv_n)  <- clean_feat_names
+rownames(sd_s)  <- rownames(sd_n)  <- clean_feat_names
+rownames(iqr_s) <- rownames(iqr_n) <- clean_feat_names
+rownames(phi_s) <- rownames(phi_n) <- clean_feat_names
+rownames(inf_s) <- rownames(inf_n) <- clean_feat_names
+names(cv_g_s)   <- names(cv_g_n)   <- clean_feat_names
+names(phi_g_s)  <- names(inf_g_s)  <- clean_feat_names
+feat_names      <- clean_feat_names
 feature_class$feature_id <- sub("\\|.*", "", feature_class$feature_id)
 
 cat("Feature IDs sanitised (\"|\"-truncated)\n")
@@ -414,61 +617,77 @@ cat("  TE example:   ", head(feat_names[is_te],  1), "\n", sep = "")
 cat("  Gene example: ", head(feat_names[!is_te], 1), "\n\n", sep = "")
 
 # Global mean CV per feature across all samples (used for ranking)
-global_cv_all  <- rowMeans(mat_cv, na.rm = TRUE)
+global_cv_all  <- cv_g_s / ifelse(cv_g_n > 0L, cv_g_n, NA_integer_)
 global_cv_te   <- global_cv_all[is_te]
 global_cv_gene <- global_cv_all[!is_te]
 
 
 # ------------------------------------------------------------------------------
-# 10. Summarise metrics by condition
+# 10. Compute condition means and build _by_cond lists
 # ------------------------------------------------------------------------------
+# Divide accumulated sums by counts; where count == 0 the result is NA.
+# Free each pair of sum/count matrices immediately after use.
 
-# Helper: column-wise mean for samples belonging to a given condition
-summarise_by_condition <- function(mat, cond) {
-  cols <- which(conditions_vector == cond)
-  if (length(cols) == 1) return(mat[, cols])
-  rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+safe_div <- function(s_mat, n_mat) {
+  res           <- s_mat / n_mat
+  res[n_mat == 0L] <- NA_real_
+  res
 }
 
-cv_by_cond <- lapply(ordered_conditions,
-                     function(c) summarise_by_condition(mat_cv, c))
-sd_by_cond <- lapply(ordered_conditions,
-                     function(c) summarise_by_condition(mat_sd, c))
-iqr_by_cond <- lapply(ordered_conditions,
-                      function(c) summarise_by_condition(mat_iqr, c))
-phi_by_cond <- lapply(ordered_conditions,
-                      function(c) summarise_by_condition(mat_phi, c))
-infrv_by_cond <- lapply(ordered_conditions,
-                        function(c) summarise_by_condition(mat_infrv, c))
+# Helper: turn an n_all × n_cond mean matrix into the named list expected by
+# build_condition_columns.  unname() removes rowname artifacts from column
+# extraction so no "|" characters leak into the output data frame.
+mat_to_list <- function(mat) {
+  lst <- lapply(ordered_conditions, function(cond) unname(mat[, cond]))
+  names(lst) <- ordered_conditions
+  lst
+}
 
-tpm_mat     <- assay(se, "abundance")
-tpm_by_cond <- lapply(ordered_conditions, function(c) {
-  cols <- which(conditions_vector == c)
-  if (length(cols) == 1) return(tpm_mat[, cols])
-  rowMeans(tpm_mat[, cols, drop = FALSE], na.rm = TRUE)
-})
+tpm_mean      <- safe_div(tpm_s, tpm_n); rm(tpm_s, tpm_n)
+tpm_by_cond   <- mat_to_list(tpm_mean);  rm(tpm_mean)
 
-names(cv_by_cond) <- names(sd_by_cond)    <-
-  names(iqr_by_cond) <- names(phi_by_cond) <-
-  names(infrv_by_cond) <- names(tpm_by_cond) <- ordered_conditions
+cv_mean       <- safe_div(cv_s,  cv_n);  rm(cv_s,  cv_n)
+cv_by_cond    <- mat_to_list(cv_mean);   rm(cv_mean)
 
-# Drop vector names to prevent "|" characters from leaking into data frames
-strip_names <- function(lst) lapply(lst, function(x) { names(x) <- NULL; x })
-cv_by_cond    <- strip_names(cv_by_cond)
-sd_by_cond    <- strip_names(sd_by_cond)
-iqr_by_cond   <- strip_names(iqr_by_cond)
-phi_by_cond   <- strip_names(phi_by_cond)
-infrv_by_cond <- strip_names(infrv_by_cond)
-tpm_by_cond   <- strip_names(tpm_by_cond)
+sd_mean       <- safe_div(sd_s,  sd_n);  rm(sd_s,  sd_n)
+sd_by_cond    <- mat_to_list(sd_mean);   rm(sd_mean)
+
+iqr_mean      <- safe_div(iqr_s, iqr_n); rm(iqr_s, iqr_n)
+iqr_by_cond   <- mat_to_list(iqr_mean);  rm(iqr_mean)
+
+phi_mean      <- safe_div(phi_s, phi_n); rm(phi_s, phi_n)
+phi_by_cond   <- mat_to_list(phi_mean);  rm(phi_mean)
+
+infrv_mean    <- safe_div(inf_s, inf_n); rm(inf_s, inf_n)
+infrv_by_cond <- mat_to_list(infrv_mean); rm(infrv_mean)
+
+gc()
 
 
 # ------------------------------------------------------------------------------
 # 11. Build per-feature metrics table
 # ------------------------------------------------------------------------------
 
-# Dynamically create one column set per condition
+# Dynamically create one column set per condition.
+# metric_by_cond must be a named list (names = ordered_conditions).
+# If a condition key is missing, a column of NA is inserted and a warning
+# is emitted so the problem is diagnosable without crashing the script.
 build_condition_columns <- function(metric_by_cond, prefix) {
-  cols <- lapply(ordered_conditions, function(c) metric_by_cond[[c]])
+  cols <- lapply(ordered_conditions, function(cond) {
+    v <- metric_by_cond[[cond]]
+    if (is.null(v)) {
+      warning("build_condition_columns: '", prefix, "[[", cond, "]]' is NULL ",
+              "(available names: ",
+              paste(names(metric_by_cond), collapse = ", "), "). ",
+              "Filling with NA.")
+      return(rep(NA_real_, n_all))
+    }
+    if (length(v) != n_all) {
+      warning("build_condition_columns: '", prefix, "[[", cond, "]]' has ",
+              "length ", length(v), " (expected ", n_all, ").")
+    }
+    v
+  })
   names(cols) <- paste0(prefix, "_", ordered_conditions)
   cols
 }
@@ -483,7 +702,8 @@ copy_metrics <- as.data.frame(
     build_condition_columns(phi_by_cond,   "mean_phi"),
     build_condition_columns(infrv_by_cond, "mean_infrv")
   ),
-  stringsAsFactors = FALSE
+  stringsAsFactors = FALSE,
+  check.names      = FALSE
 )
 rownames(copy_metrics) <- NULL
 
@@ -588,14 +808,14 @@ cat("Table saved: 04_cv_summary_by_feature_type.tsv\n\n")
 # 16. Run-level summary table
 # ------------------------------------------------------------------------------
 
-n_complete_te <- sum(complete.cases(mat_cv))
+n_complete_te <- sum(cv_g_n == n_samples)
 n_families    <- length(unique(copy_metrics$family[
   copy_metrics$family != "Unknown"]))
 
 run_summary <- data.frame(
   parameter = c(
     "conditions_file", "salmon_dir", "classification_file",
-    "n_gibbs_replicates", "n_samples", "n_conditions",
+    "n_gibbs_replicates_sample1", "n_samples", "n_conditions",
     "n_te_copies", "n_genes",
     "n_te_families", "te_classification_match_pct",
     "n_te_complete_cv", "pct_te_complete_cv",
@@ -641,7 +861,7 @@ cat("\nDataset\n")
 cat("  TE copies:           ", n_te,      "\n")
 cat("  Protein-coding genes:", n_gene,    "\n")
 cat("  Samples:             ", n_samples, "\n")
-cat("  Gibbs replicates:    ", n_gibbs,   "\n")
+cat("  Gibbs replicates:    ", n_gibbs, " (from first sample meta_info.json)\n")
 cat("  TE families:         ", n_families,"\n")
 cat("  Classification match:", pct_matched, "%\n")
 cat("  TEs with complete CV:",
