@@ -303,26 +303,81 @@ message("Saved full RAW p-value matrix: ", out_pvals)
 # 6. GLOBAL FDR (BENJAMINI-HOCHBERG) CORRECTION + FILTERED EDGE LIST
 # ==============================================================================
 # This is the step that requires ALL pairs to be seen together (see the note
-# at the top of the script). We read back every chunk's unfiltered pairs
-# file, combine them into one table covering every tested pair exactly once,
-# then apply p.adjust(method = "BH") across the WHOLE pvalue column at once.
-# Only after that do we filter by |r| and by the FDR-adjusted q-value.
-message("Loading all pairwise tests for global FDR correction (", 
-        format(total_pairs, big.mark = ","), " pairs)...")
+# at the top of the script). It CANNOT be done by rbindlist()-ing every
+# chunk's pairs file into one table: R (and data.table specifically) index
+# rows with a 32-bit integer, so any single table/vector is capped at
+# .Machine$integer.max = 2,147,483,647 rows. Once n_genes gets into the tens
+# of thousands, total_pairs blows past that ceiling (here: ~3.94 billion),
+# and rbindlist() errors out ("... maior que o numero maximo de linhas...").
+#
+# Fix: never materialize one row per pair. Instead:
+#   1. Every worker in step 3 already rounds p-values with
+#      signif(pval_block, 4), so only a bounded number of DISTINCT p-values
+#      can occur (4 significant digits x a few hundred possible exponents),
+#      no matter how many billions of pairs exist. We build ONE small
+#      GLOBAL FREQUENCY TABLE (distinct p-value -> count across the whole
+#      dataset) instead of one row per pair.
+#   2. Benjamini-Hochberg only needs, for each p-value, the count of
+#      p-values <= it (its rank) to compute its adjusted q-value -- exactly
+#      what the frequency table's cumulative count gives us. This
+#      reproduces p.adjust(method = "BH") exactly, ties included, and since
+#      BH q-values are monotonic non-decreasing in p, it also gives an
+#      EXACT p-value cutoff below which q < Q_THRESH (not an approximation).
+#   3. Only rows that also pass the |r| > R_THRESH filter (a small subset
+#      of all pairs, in any realistic coexpression network) are ever kept
+#      as individual rows, so the final rbindlist() is safe.
+message("Scanning all pairwise tests once (", format(total_pairs, big.mark = ","),
+        " pairs) for the r-threshold prefilter and the BH p-value frequency table...")
 
-all_pairs <- rbindlist(
-  lapply(results, function(res) {
-    fread(res$pairs, header = FALSE,
-          col.names = c("Node1", "Node2", "weight", "pvalue"))
-  })
-)
+scan_results <- mclapply(results, function(res) {
+  chunk_pairs <- fread(res$pairs, header = FALSE,
+                       col.names = c("Node1", "Node2", "weight", "pvalue"))
+  # A chunk whose rows are all >= the last global column index (e.g. the
+  # final chunk, if it happens to contain only the very last gene/TE) has
+  # no upper-triangle pairs at all, so its tmp file is empty; fread() then
+  # returns a 0-column data.table instead of the 4 named columns.
+  if (ncol(chunk_pairs) == 0) {
+    chunk_pairs <- data.table(Node1 = character(0), Node2 = character(0),
+                              weight = numeric(0), pvalue = numeric(0))
+  }
+  list(
+    freq       = chunk_pairs[, .(count = as.numeric(.N)), by = pvalue],
+    candidates = chunk_pairs[abs(weight) > R_THRESH]
+  )
+}, mc.cores = N_CORES)
 
-message("Applying Benjamini-Hochberg (BH) correction across all tests...")
-all_pairs[, qvalue := p.adjust(pvalue, method = "BH")]
+freq_master <- rbindlist(lapply(scan_results, `[[`, "freq"))[, .(count = sum(count)), by = pvalue]
+candidates  <- rbindlist(lapply(scan_results, `[[`, "candidates"))
+rm(scan_results); gc()
+
+stopifnot(sum(freq_master$count) == total_pairs)  # every pair accounted for exactly once
+message("Distinct raw p-values across the dataset: ", format(nrow(freq_master), big.mark = ","))
+message("Candidate edges with |r| > ", R_THRESH, " (pre FDR filter): ",
+        format(nrow(candidates), big.mark = ","))
+
+message("Applying Benjamini-Hochberg (BH) correction across all ",
+        format(total_pairs, big.mark = ","), " tests...")
+setorder(freq_master, pvalue)
+freq_master[, cum_count := cumsum(count)]
+freq_master[, term := pmin(1, pvalue * total_pairs / cum_count)]
+freq_master[, qvalue := rev(cummin(rev(term)))]  # BH: running min from the largest p-value down
+
+passing  <- freq_master[qvalue < Q_THRESH]
+p_cutoff <- if (nrow(passing) > 0) max(passing$pvalue) else -1
+message("BH-adjusted p-value cutoff for q < ", Q_THRESH, ": ",
+        if (p_cutoff >= 0) format(p_cutoff, scientific = TRUE) else "(no pair passes)")
 
 message("Filtering edges (|r| > ", R_THRESH, " and FDR q < ", Q_THRESH, ")...")
-edge_list <- all_pairs[abs(weight) > R_THRESH & qvalue < Q_THRESH]
-rm(all_pairs); gc()
+edge_list <- candidates[pvalue <= p_cutoff]
+if (nrow(edge_list) > 0) {
+  edge_list <- merge(edge_list, freq_master[, .(pvalue, qvalue)],
+                      by = "pvalue", all.x = TRUE, sort = FALSE)
+  setcolorder(edge_list, c("Node1", "Node2", "weight", "pvalue", "qvalue"))
+} else {
+  edge_list <- data.table(Node1 = character(0), Node2 = character(0),
+                           weight = numeric(0), pvalue = numeric(0), qvalue = numeric(0))
+}
+rm(candidates, freq_master, passing); gc()
 
 # Flag each node as "gene" or "TE" based on the ID pattern above.
 # This makes it easy downstream to separate TE-TE, TE-gene, and gene-gene
