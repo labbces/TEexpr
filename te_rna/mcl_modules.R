@@ -198,7 +198,7 @@ p_rank <- ggplot(rank_long, aes(x = module_name, y = value, fill = panel)) +
         axis.text.x = element_blank(), axis.ticks.x = element_blank(),
         panel.spacing = unit(1.3, "lines"))
 
-ggsave(paste0(PREFIX, "_module_TE_ranking.pdf"), p_rank, width = 12, height = 6.5, device = cairo_pdf)
+ggsave(paste0(PREFIX, "_module_TE_ranking.pdf"), p_rank, width = 12, height = 6.5)
 ggsave(paste0(PREFIX, "_module_TE_ranking.png"), p_rank, width = 12, height = 6.5, dpi = 300)
 cat("  Saved:", basename(paste0(PREFIX, "_module_TE_ranking.pdf")), "\n")
 
@@ -258,7 +258,7 @@ axis_lbl <- switch(axis_mode,
                    "linear y-axis")
 p_comp <- p_comp + labs(subtitle = "Modules containing transposable elements")
 
-ggsave(paste0(PREFIX, "_module_composition.pdf"), p_comp, width = 10, height = 7.5, device = cairo_pdf)
+ggsave(paste0(PREFIX, "_module_composition.pdf"), p_comp, width = 10, height = 7.5)
 ggsave(paste0(PREFIX, "_module_composition.png"), p_comp, width = 10, height = 7.5, dpi = 300)
 cat("  Saved:", basename(paste0(PREFIX, "_module_composition.pdf")), "\n")
 
@@ -312,7 +312,7 @@ if (n_te_modules == 0) {
     theme(axis.text.y = element_text(size = 9))
 
   fig_height <- max(4, 0.28 * n_te_modules + 1.5)
-  ggsave(paste0(PREFIX, "_TE_hub_per_module.pdf"), p_hub, width = 9, height = fig_height, device = cairo_pdf)
+  ggsave(paste0(PREFIX, "_TE_hub_per_module.pdf"), p_hub, width = 9, height = fig_height)
   ggsave(paste0(PREFIX, "_TE_hub_per_module.png"), p_hub, width = 9, height = fig_height, dpi = 300)
   cat("  Saved:", basename(paste0(PREFIX, "_TE_hub_per_module.pdf")), "\n")
 
