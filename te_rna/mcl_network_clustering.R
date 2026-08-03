@@ -1,9 +1,10 @@
 library(data.table)
 library(igraph)
-library(ggplot2)
+
 
 # ==============================================================================
-# LOCAL DEFAULTS (overridden by a CLI flag)
+# LOCAL DEFAULTS
+#   Overridden by a CLI flag
 # ==============================================================================
 DEFAULTS <- list(
   edge_file            = "~/networks/edges_Sitalica_k1_r0.8_q0.05.tsv",
@@ -11,14 +12,13 @@ DEFAULTS <- list(
   group_name           = "S. italica",
   inflation            = 2,    # too many tiny modules -> lower (1.4, 1.8); too few huge -> raise (2.5, 4.0)
   min_module_size      = 2,    # modules smaller than this -> "Unassigned"
-  min_module_size_plot = 10,   # minimum module size shown in the plot
   cores                = 1,     # threads for C MCL (-te) and data.table
   mcl_bin              = "mcl"  # name or full path of the C MCL binary (e.g. /usr/bin/mcl)
 )
 
 # ==============================================================================
 # CLI ARGUMENT PARSING
-#   Example:
+#   Example (SGE):
 #     Rscript mcl_clustering.r \
 #         --edge_file  /path/edges.tsv \
 #         --output_prefix /path/mcl_specie_k \
@@ -44,7 +44,6 @@ GROUP_NAME <- parse_arg("--group_name",    DEFAULTS$group_name)
 # --- Tunable parameters -------------------------------------------------------
 INFLATION            <- as.numeric(parse_arg("--inflation",            DEFAULTS$inflation))
 MIN_MODULE_SIZE      <- as.integer(parse_arg("--min_module_size",      DEFAULTS$min_module_size))
-MIN_MODULE_SIZE_PLOT <- as.integer(parse_arg("--min_module_size_plot", DEFAULTS$min_module_size_plot))
 NUM_CORES            <- as.integer(parse_arg("--cores",                DEFAULTS$cores))
 MCL_BIN              <- parse_arg("--mcl_bin", DEFAULTS$mcl_bin)
 
@@ -75,18 +74,13 @@ cat(sprintf("  group_name           : %s\n", GROUP_NAME))
 cat(sprintf("  mcl_bin              : %s\n", MCL_PATH))
 cat(sprintf("  inflation            : %.2f\n", INFLATION))
 cat(sprintf("  min_module_size      : %d\n", MIN_MODULE_SIZE))
-cat(sprintf("  min_module_size_plot : %d\n", MIN_MODULE_SIZE_PLOT))
 cat(sprintf("  cores                : %d\n", NUM_CORES))
 
 # --- msc_palette (custom project colours) ------------------------------------
+# Kept for reference / potential downstream use (e.g. mcl_postprocess.r), even
+# though this script no longer renders any figures itself.
 msc_palette <- c("#ba4134", "#bf7e46", "#8894b7", "#949941",
                  "#f5c74d", "#ddc5a9", "#5d556a", "#1a657a")
-
-# Node-type colours: distinct, colour-blind-distinguishable choices from msc_palette
-# Gene = teal (#1a657a), TE = rust red (#ba4134)
-NODE_TYPE_COLOURS <- c(gene = "#1a657a", TE = "#ba4134")
-# Shapes as a redundant (colour-independent) encoding for scatter/point plots
-NODE_TYPE_SHAPES  <- c(gene = 16, TE = 17)   # 16 = filled circle, 17 = filled triangle
 
 # ==============================================================================
 # HELPER: classify a node as TE or gene
@@ -98,12 +92,10 @@ classify_node_type <- function(node_names, type_lookup = NULL) {
   if (!is.null(type_lookup)) {
     out <- unname(type_lookup[node_names])
   }
-  # Fallback / normalisation via the TE_ prefix convention
-  needs_fill <- is.na(out)
+  # Fill anything still missing (or inconsistently labelled) using the TE_
+  # prefix convention; anything else defaults to "gene".
+  needs_fill <- is.na(out) | !out %in% c("gene", "TE")
   out[needs_fill] <- ifelse(grepl("^TE_", node_names[needs_fill]), "TE", "gene")
-  # Normalise any stray casing/labels coming from the file
-  out <- ifelse(grepl("^TE", out, ignore.case = TRUE) | grepl("^TE_", node_names),
-                "TE", "gene")
   out
 }
 
@@ -174,7 +166,7 @@ run_mcl_multicore <- function(g, inflation, cores, mcl_path = "mcl") {
 # MAIN: cluster one network
 # ==============================================================================
 cluster_network <- function(group_name, edge_file, prefix,
-                            inflation, min_module_size, min_module_size_plot,
+                            inflation, min_module_size,
                             n_cores, mcl_path = "mcl") {
   
   cat("\n", strrep("=", 60), "\n", sep = "")
@@ -277,15 +269,12 @@ cluster_network <- function(group_name, edge_file, prefix,
   # Kept column name as 'resolution' for file schema compatibility, but populated with inflation value
   summary_dt[, resolution      := inflation]
   summary_dt[, min_module_size := min_module_size]
-  summary_dt[, shown_in_plot   := n_nodes >= min_module_size_plot & module_name != "Unassigned"]
   
   n_modules_all    <- sum(summary_dt$module_name != "Unassigned")
-  n_modules_plot   <- sum(summary_dt$shown_in_plot)
   n_unassigned     <- membership_dt[module_name == "Unassigned", .N]
   assigned_modules <- summary_dt[module_name != "Unassigned"]
   
   cat(sprintf("  Total modules (>= %d nodes): %d\n", min_module_size, n_modules_all))
-  cat(sprintf("  Modules shown in plot (>= %d nodes): %d\n", min_module_size_plot, n_modules_plot))
   cat(sprintf("  Unassigned nodes:    %d\n", n_unassigned))
   cat(sprintf("  Largest module:      %d nodes\n", max(assigned_modules$n_nodes)))
   cat(sprintf("  Median module size:  %.0f nodes\n", median(assigned_modules$n_nodes)))
@@ -298,43 +287,37 @@ cluster_network <- function(group_name, edge_file, prefix,
                            .SDcols = c("node", "node_type", "strength", "degree")]
   hubs_dt[, hub_rank := seq_len(.N), by = module_name]
   
-  # ── 8. Plot data table (long format: one row per module × node_type) ──
-  plot_modules <- summary_dt[shown_in_plot == TRUE][order(-n_nodes)]
-  module_levels <- plot_modules$module_name
-  
-  plot_dt <- melt(
-    plot_modules[, .(module_name, gene = n_genes, TE = n_TEs)],
-    id.vars       = "module_name",
-    variable.name = "node_type",
-    value.name    = "n_nodes"
-  )
-  plot_dt[, module_name := factor(module_name, levels = module_levels)]
-  plot_dt[, node_type   := factor(node_type, levels = c("gene", "TE"))]
-  
-  # ── 9. Save all output files ──────────────────────────────────────
+  # ── 8. Save output files ───────────────────────────────────────────
   out_membership <- paste0(prefix, "_membership.tsv")
   out_summary    <- paste0(prefix, "_module_summary.tsv")
   out_hubs       <- paste0(prefix, "_hub_nodes.tsv")
-  out_plot_data  <- paste0(prefix, "_plot_data.tsv")
   
   fwrite(membership_dt[, .(node, node_type, module_name, strength, degree)],
          file = out_membership, sep = "\t", quote = FALSE)
   
   fwrite(summary_dt[, .(module = module_name, n_nodes, n_genes, n_TEs,
-                        modularity_Q, resolution, min_module_size, shown_in_plot)],
+                        modularity_Q, resolution, min_module_size)],
          file = out_summary, sep = "\t", quote = FALSE)
   
   fwrite(hubs_dt,
          file = out_hubs, sep = "\t", quote = FALSE)
   
-  fwrite(plot_dt[, .(module = as.character(module_name), node_type, n_nodes)],
-         file = out_plot_data, sep = "\t", quote = FALSE)
-  
   cat("  Saved:", basename(out_membership), "\n")
   cat("  Saved:", basename(out_summary),    "\n")
   cat("  Saved:", basename(out_hubs),       "\n")
-  cat("  Saved:", basename(out_plot_data),  "\n")
   
+  cat("Clustering complete for:", group_name, "\n")
+  
+  invisible(list(
+    group      = group_name,
+    graph      = g,
+    membership = membership_dt,
+    summary    = summary_dt,
+    hubs       = hubs_dt,
+    modularity = q
+  ))
+}
+
 # ==============================================================================
 # ENTRY POINT
 #   One network per invocation, driven entirely by CLI arguments. To process
@@ -347,7 +330,6 @@ result <- cluster_network(
   prefix               = PREFIX,
   inflation            = INFLATION,
   min_module_size      = MIN_MODULE_SIZE,
-  min_module_size_plot = MIN_MODULE_SIZE_PLOT,
   n_cores              = NUM_CORES,
   mcl_path             = MCL_PATH
 )
