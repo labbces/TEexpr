@@ -66,16 +66,16 @@ NODE_TYPE_SHAPES  <- c(gene = 16, TE = 17)                 # circle / triangle
 
 # Shared theme so every figure matches dissertation formatting ----------------
 theme_msc <- function(base = 13) {
-  theme_classic(base_size = base, base_family = "Arial") +
+  theme_classic(base_size = base, base_family = "Helvetica") +
     theme(
-      plot.title    = element_text(face = "bold", size = 26, hjust = 0.5, family = "Arial",
+      plot.title    = element_text(face = "bold", size = 26, hjust = 0.5, family = "Helvetica",
                                    margin = margin(b = 10)),
-      plot.subtitle = element_text(size = 13, hjust = 0.5, family = "Arial", margin = margin(b = 8)),
+      plot.subtitle = element_text(size = 13, hjust = 0.5, family = "Helvetica", margin = margin(b = 8)),
       plot.margin   = margin(t = 15, r = 20, b = 10, l = 10),
-      axis.title    = element_text(size = 16, family = "Arial"),
-      axis.text     = element_text(size = 12, family = "Arial"),
-      legend.title  = element_text(size = 16, family = "Arial"),
-      legend.text   = element_text(size = 14, family = "Arial"),
+      axis.title    = element_text(size = 16, family = "Helvetica"),
+      axis.text     = element_text(size = 12, family = "Helvetica"),
+      legend.title  = element_text(size = 16, family = "Helvetica"),
+      legend.text   = element_text(size = 14, family = "Helvetica"),
       legend.position = "top",
       panel.grid.major = element_line(colour = "grey87", linewidth = 0.3),
       panel.grid.minor = element_blank()
@@ -182,7 +182,7 @@ PANEL_COLOURS <- c("Module size (log10 nodes)" = "#8894b7", "TE count" = "#ba413
 
 p_rank <- ggplot(rank_long, aes(x = module_name, y = value, fill = panel)) +
   geom_col(width = 0.7, colour = "grey25", linewidth = 0.15, alpha = 0.9) +
-  geom_text(aes(label = label), hjust = -0.15, size = 3, family = "Arial") +
+  geom_text(aes(label = label), hjust = -0.15, size = 3, family = "Helvetica") +
   coord_flip(clip = "off") +
   facet_wrap(~ panel, scales = "free_x") +
   scale_y_continuous(expand = expansion(mult = c(0.02, 0.22))) +
@@ -192,7 +192,7 @@ p_rank <- ggplot(rank_long, aes(x = module_name, y = value, fill = panel)) +
     x = "Module", y = NULL
   ) +
   theme_msc() +
-  theme(strip.text = element_text(size = 13, face = "bold", family = "Arial"),
+  theme(strip.text = element_text(size = 13, face = "bold", family = "Helvetica"),
         strip.background = element_rect(fill = "#ddc5a9", colour = NA),
         axis.text.y = element_text(size = 9),
         axis.text.x = element_blank(), axis.ticks.x = element_blank(),
@@ -300,7 +300,7 @@ if (n_te_modules == 0) {
     geom_segment(aes(x = 0, xend = strength, y = module_lbl, yend = module_lbl),
                 colour = "#8894b7", linewidth = 0.6) +
     geom_point(size = 3.2, colour = "#ba4134", shape = 17) +
-    geom_text(aes(label = node), hjust = -0.15, size = 3, family = "Arial") +
+    geom_text(aes(label = node), hjust = -0.15, size = 3, family = "Helvetica") +
     scale_x_continuous(expand = expansion(mult = c(0, 0.3))) +
     labs(
       title    = paste("Most central TE per module \u2014", GROUP_NAME),
